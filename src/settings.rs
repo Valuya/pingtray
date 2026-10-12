@@ -286,6 +286,10 @@ impl SettingsApp {
             ui.checkbox(&mut p.maximize_when_travelling, "Maximize charge when plugged in while travelling");
             ui.weak("Typically: you found a socket on the train and want a full battery.");
             ui.checkbox(&mut p.preserve_when_unplugged, "Back to Preserve Battery Health when unplugged");
+            ui.checkbox(
+                &mut p.preserve_when_not_travelling,
+                "Preserve Battery Health whenever not travelling (at start, and when a journey ends)",
+            );
             ui.add_space(8.0);
             ui.label(RichText::new("Travelling means").strong());
             ui.checkbox(&mut p.moving, "Moving in a vehicle, according to the phone's positions (last 10 minutes)");
@@ -316,8 +320,8 @@ impl SettingsApp {
             });
             ui.add_space(8.0);
             ui.weak(
-                "pingtray only switches when you plug in, unplug, or start travelling while plugged in: \
-                 a mode you choose by hand (here, in GNOME or from the battery icon) stays until then.",
+                "pingtray switches only when something changes (plugging in, unplugging, a journey \
+                 starting or ending) and once at start: a mode you choose by hand stays until then.",
             );
         });
     }

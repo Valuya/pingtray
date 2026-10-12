@@ -21,6 +21,8 @@ pub struct PowerConfig {
     pub maximize_when_travelling: bool,
     /// Unplugged: back to preserving the battery.
     pub preserve_when_unplugged: bool,
+    /// Not travelling (at start, or when a journey ends): preserve too.
+    pub preserve_when_not_travelling: bool,
     /// Travelling when the phone's positions show a vehicle lately.
     pub moving: bool,
     /// Travelling when connected to one of these networks (e.g. the phone's hotspot).
@@ -33,6 +35,7 @@ impl Default for PowerConfig {
             enabled: false,
             maximize_when_travelling: true,
             preserve_when_unplugged: true,
+            preserve_when_not_travelling: true,
             moving: true,
             networks: Vec::new(),
         }
@@ -126,8 +129,8 @@ pub enum Action {
     Preserve,
 }
 
-/// Acts on changes only, so that a choice made by hand (in GNOME's settings
-/// or the icon's menu) stays until the next plug or unplug.
+/// Acts on changes only (and once at start), so that a choice made by hand
+/// (in GNOME's settings or the icon's menu) stays until the next change.
 #[derive(Default)]
 pub struct Policy {
     plugged: Option<bool>,
@@ -137,6 +140,7 @@ pub struct Policy {
 impl Policy {
     pub fn step(&mut self, cfg: &PowerConfig, plugged: bool, travelling: bool) -> Option<Action> {
         let was_plugged = self.plugged.replace(plugged);
+        let first = was_plugged.is_none();
         let was_travelling = std::mem::replace(&mut self.travelling, travelling);
         let plugged_in = plugged && was_plugged != Some(true);
         let started_travelling = plugged && travelling && !was_travelling;
@@ -144,6 +148,9 @@ impl Policy {
             return Some(Action::Maximize);
         }
         if cfg.preserve_when_unplugged && !plugged && was_plugged == Some(true) {
+            return Some(Action::Preserve);
+        }
+        if cfg.preserve_when_not_travelling && !travelling && (first || was_travelling) {
             return Some(Action::Preserve);
         }
         None
@@ -238,16 +245,28 @@ mod tests {
     fn plug_in_on_the_train_then_unplug() {
         let cfg = PowerConfig { enabled: true, ..Default::default() };
         let mut p = Policy::default();
-        assert_eq!(p.step(&cfg, false, true), None); // on the train, on battery
+        assert_eq!(p.step(&cfg, false, true), None); // starts on the train, on battery
         assert_eq!(p.step(&cfg, true, true), Some(Action::Maximize)); // found a socket
         assert_eq!(p.step(&cfg, true, true), None); // no repeat: manual changes stay
         assert_eq!(p.step(&cfg, false, true), Some(Action::Preserve)); // unplugged
-        assert_eq!(p.step(&cfg, true, false), None); // plugged in at home
+        assert_eq!(p.step(&cfg, true, false), Some(Action::Preserve)); // home: journey over
+    }
+
+    #[test]
+    fn at_home_preserves_at_start_and_after_a_journey() {
+        let cfg = PowerConfig::default();
+        let mut p = Policy::default();
+        assert_eq!(p.step(&cfg, true, false), Some(Action::Preserve)); // starts at home
+        assert_eq!(p.step(&cfg, true, false), None); // manual MAX stays
+        assert_eq!(p.step(&cfg, true, true), Some(Action::Maximize));
+        assert_eq!(p.step(&cfg, true, false), Some(Action::Preserve)); // journey over
+        let off = PowerConfig { preserve_when_not_travelling: false, ..Default::default() };
+        assert_eq!(Policy::default().step(&off, true, false), None);
     }
 
     #[test]
     fn plugged_in_then_the_journey_starts() {
-        let cfg = PowerConfig::default();
+        let cfg = PowerConfig { preserve_when_not_travelling: false, ..Default::default() };
         let mut p = Policy::default();
         assert_eq!(p.step(&cfg, true, false), None);
         assert_eq!(p.step(&cfg, true, true), Some(Action::Maximize));
