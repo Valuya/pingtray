@@ -31,6 +31,8 @@ pub struct MapInput<'a> {
     /// Colour for the connection at a given time (ms), if any ping covers it.
     pub quality: &'a dyn Fn(i64) -> Option<Color32>,
     pub max_gap_ms: i64,
+    /// Whether any position was ever received.
+    pub ever: bool,
 }
 
 fn rgb(c: [u8; 3]) -> Color32 {
@@ -74,8 +76,22 @@ impl MapView {
         }
     }
 
-    /// Draws the panel; returns a time (unix s) when the user clicked on the track.
-    pub fn ui(&mut self, ui: &mut egui::Ui, input: &MapInput<'_>) -> Option<f64> {
+    /// Draws the panel; returns a time (unix s) when the user clicked on the
+    /// track, and whether they asked to set the phone up.
+    pub fn ui(&mut self, ui: &mut egui::Ui, input: &MapInput<'_>) -> (Option<f64>, bool) {
+        if !input.ever {
+            let mut setup = false;
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("No positions yet");
+                ui.add_space(6.0);
+                ui.label("The map shows where each ping was sent from, using your phone's GPS.");
+                ui.label("Install OwnTracks (or GPSLogger) on the phone and point it at pingtray.");
+                ui.add_space(8.0);
+                setup = ui.button("Set up the phone…").clicked();
+            });
+            return (None, setup);
+        }
         let (from, to) = ((input.view.0 * 1000.0) as i64, (input.view.1 * 1000.0) as i64);
         let visible: Vec<Fix> = input.fixes.iter().copied().filter(|f| f.ts_ms >= from && f.ts_ms <= to).collect();
 
@@ -91,7 +107,7 @@ impl MapView {
 
         if visible.is_empty() {
             ui.centered_and_justified(|ui| ui.label("No position in this time range."));
-            return None;
+            return (None, false);
         }
         let bbox = visible.iter().fold([90.0, 180.0, -90.0, -180.0], |b: [f64; 4], f| {
             [b[0].min(f.lat), b[1].min(f.lon), b[2].max(f.lat), b[3].max(f.lon)]
@@ -160,7 +176,7 @@ impl MapView {
                         .map(|(f, _)| f.ts_ms as f64 / 1000.0);
                 }
             });
-        clicked
+        (clicked, false)
     }
 
     fn legend(&self, ui: &mut egui::Ui, input: &MapInput<'_>, visible: &[Fix]) {

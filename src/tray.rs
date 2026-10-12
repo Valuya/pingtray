@@ -60,6 +60,14 @@ pub fn open_settings(config_path: &std::path::Path) {
     spawn_self(config_path, &["settings"]);
 }
 
+pub fn open_note(config_path: &std::path::Path) {
+    spawn_self(config_path, &["note"]);
+}
+
+pub fn open_settings_tab(config_path: &std::path::Path, tab: &str) {
+    spawn_self(config_path, &["settings", "--tab", tab]);
+}
+
 pub fn open_power_settings(config_path: &std::path::Path) {
     spawn_self(config_path, &["settings", "--tab", "power"]);
 }
@@ -163,6 +171,12 @@ mod sni {
                         }
                         .into(),
                     ],
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Add note…".into(),
+                    activate: Box::new(|t: &mut Self| open_note(&t.0.config_path)),
                     ..Default::default()
                 }
                 .into(),

@@ -42,6 +42,14 @@ applies the changes at once (pingtray restarts itself).
 They are stored in `~/.config/pingtray/config.toml`. History is kept per
 destination name: renaming one starts a new history.
 
+## Notes
+
+*Add note…* in the tray menu (or *Note…* in the graph window, or
+`pingtray note crowded` in a terminal) records what the graph cannot know:
+crowded train, quiet carriage, Wi-Fi on board. Notes show as markers on
+the charts, and the tooltip gives the latest one before the moment under
+the mouse.
+
 ## Battery charging (Linux)
 
 Settings → Power: when you plug in while travelling (moving according to

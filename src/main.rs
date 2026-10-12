@@ -5,6 +5,7 @@ mod http_probe;
 mod icon;
 mod location;
 mod map;
+mod notes;
 mod pinger;
 mod power;
 mod settings;
@@ -40,6 +41,10 @@ enum Command {
     Collect,
     /// Open the graph window.
     View,
+    /// Add a note for now ("crowded train"); without text, open the note window.
+    Note {
+        text: Vec<String>,
+    },
     /// Open the settings window.
     Settings {
         /// Tab to open: destinations, pinging, tray, positions or power.
@@ -141,6 +146,7 @@ fn main() -> Result<()> {
             viewer::run(cfg, config_path)
         }
         Command::Autostart { remove } => autostart(remove, &config_path),
+        Command::Note { text } => notes::run(&text),
         Command::Settings { tab } => {
             let Some(_lock) = single_instance("settings.lock")? else {
                 tracing::info!("settings already open");

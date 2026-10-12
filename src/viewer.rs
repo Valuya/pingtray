@@ -17,7 +17,7 @@ use crate::icon::percentile;
 use crate::icon::Thresholds;
 use crate::location::Fix;
 use crate::map::{ColorBy, MapInput, MapView};
-use crate::store::{Bucket, MAX, MEDIAN, MIN, P10, P90, Store, TargetRow};
+use crate::store::{Bucket, MAX, MEDIAN, MIN, Note, P10, P90, Store, TargetRow};
 use crate::transport::{self, Segment};
 
 const SPANS: &[(&str, f64)] = &[
@@ -119,6 +119,7 @@ struct Answer {
     fixes: Vec<Fix>,
     /// HTTP series: median phases per bucket.
     phases: HashMap<i64, Vec<(i64, [f64; 4])>>,
+    notes: Vec<Note>,
 }
 
 enum Msg {
@@ -128,6 +129,7 @@ enum Msg {
 
 pub struct ViewerApp {
     interval_secs: f64,
+    http_interval_secs: f64,
     config_path: PathBuf,
     thresholds: Thresholds,
     max_gap_ms: i64,
@@ -229,7 +231,9 @@ fn spawn_worker(db: PathBuf, max_gap_ms: i64, ctx: egui::Context) -> (mpsc::Send
                     (!p.is_empty()).then_some((id, p))
                 })
                 .collect();
-            if ans_tx.send(Msg::Data(Answer { query: q, data, fixes, phases })).is_err() {
+            // notes from a while before, so the tooltip can say what applied
+            let notes = store.notes(q.from_ms - 4 * 3_600_000, q.to_ms).unwrap_or_default();
+            if ans_tx.send(Msg::Data(Answer { query: q, data, fixes, phases, notes })).is_err() {
                 return;
             }
             ctx.request_repaint();
@@ -268,6 +272,7 @@ impl ViewerApp {
         let now = now_ms() as f64 / 1000.0;
         Ok(ViewerApp {
             interval_secs: cfg.interval_secs,
+            http_interval_secs: cfg.http_interval_secs,
             config_path,
             thresholds: Thresholds { warn_ms: cfg.warn_ms, bad_ms: cfg.bad_ms },
             max_gap_ms,
@@ -284,7 +289,7 @@ impl ViewerApp {
             loaded: None,
             segments: Vec::new(),
             has_fixes,
-            map: (prefs.map && has_fixes).then(|| MapView::new(&cc.egui_ctx, prefs.color_by)),
+            map: prefs.map.then(|| MapView::new(&cc.egui_ctx, prefs.color_by)),
             saved_prefs: prefs.clone(),
             hover_x: None,
             highlight: None,
@@ -302,7 +307,10 @@ impl ViewerApp {
     }
 
     fn bucket_secs(&self) -> f64 {
-        let want = (self.span() / MAX_POINTS).max(self.interval_secs * MIN_PINGS_PER_POINT);
+        // enough samples of the reference per point for its smoke to mean something
+        let http_reference = self.show_http && self.reference.as_deref().is_some_and(|r| r.ends_with("|http"));
+        let interval = if http_reference { self.http_interval_secs } else { self.interval_secs };
+        let want = (self.span() / MAX_POINTS).max(interval * MIN_PINGS_PER_POINT);
         STEPS.iter().copied().find(|&s| s >= want).unwrap_or(*STEPS.last().unwrap())
     }
 
@@ -365,6 +373,9 @@ impl ViewerApp {
             if ui.button("⚙").on_hover_text("Settings").clicked() {
                 crate::tray::open_settings(&self.config_path);
             }
+            if ui.button("Note…").on_hover_text("Note what the graph cannot know: crowded train, Wi-Fi on board…").clicked() {
+                crate::tray::open_note(&self.config_path);
+            }
             ui.checkbox(&mut self.follow, "Live");
             ui.checkbox(&mut self.log_y, "Log scale");
             ui.checkbox(&mut self.show_ping, "Ping").on_hover_text("ICMP echo: solid lines");
@@ -376,11 +387,9 @@ impl ViewerApp {
             ui.checkbox(&mut self.split, "Split").on_hover_text("One chart per target");
             ui.checkbox(&mut self.loss_colours, "Loss colours")
                 .on_hover_text("SmokePing look: grey smoke, median coloured by packet loss (charts with one target)");
-            if self.has_fixes {
-                let mut on = self.map.is_some();
-                if ui.checkbox(&mut on, "Map").changed() {
-                    self.map = on.then(|| MapView::new(ui.ctx(), self.saved_prefs.color_by));
-                }
+            let mut on = self.map.is_some();
+            if ui.checkbox(&mut on, "Map").changed() {
+                self.map = on.then(|| MapView::new(ui.ctx(), self.saved_prefs.color_by));
             }
             ui.separator();
             for t in &mut self.targets {
@@ -458,6 +467,7 @@ impl ViewerApp {
         let view = self.view;
         let log_y = self.log_y;
         let grey = ui.visuals().strong_text_color();
+        let note_color = ui.visuals().strong_text_color();
         // one chart with every target, or one chart each
         let groups: Vec<Vec<&TargetView>> =
             if self.split { shown.iter().map(|t| vec![*t]).collect() } else { vec![shown.clone()] };
@@ -561,6 +571,22 @@ impl ViewerApp {
                 if !loss_colours && let Some(s) = series.get(reference) {
                     draw_loss_marks(pui, std::slice::from_ref(s), bucket_s, y_min, y_max);
                 }
+                for note in answer.notes.iter().filter(|n| (n.ts_ms as f64 / 1000.0) >= view.0) {
+                    let x = note.ts_ms as f64 / 1000.0;
+                    pui.vline(
+                        egui_plot::VLine::new(&note.text, x)
+                            .color(note_color.gamma_multiply(0.6))
+                            .style(egui_plot::LineStyle::dotted_dense())
+                            .width(1.2),
+                    );
+                    if i == 0 {
+                        pui.text(
+                            egui_plot::Text::new(&note.text, PlotPoint::new(x, y_max), RichText::new(format!(" {}", note.text)).strong())
+                                .color(note_color)
+                                .anchor(egui::Align2::LEFT_TOP),
+                        );
+                    }
+                }
                 (pui.plot_bounds(), pui.pointer_coordinate())
             });
             if r.response.dragged() {
@@ -601,6 +627,7 @@ impl ViewerApp {
                     let place = describe_place(&answer.fixes, &self.segments, p.x, self.max_gap_ms);
                     let show = |ui: &mut egui::Ui| {
                         tooltip_ui(ui, p.x, bucket_ms, &series, new_highlight, reference_id, place.as_deref());
+                        note_line(ui, &answer.notes, p.x);
                     };
                     if fake.is_some() {
                         let at = r.transform.position_from_point(&p);
@@ -863,7 +890,8 @@ impl Scale {
 
     fn axes<'a>(&self) -> Vec<egui_plot::AxisHints<'a>> {
         let me = *self;
-        let main_label = if self.main_is_http { "HTTP" } else { "ping" };
+        let title = |t: &str| RichText::new(t).strong();
+        let main_label = title(if self.main_is_http { "HTTP request (ms)" } else { "ICMP ping (ms)" });
         let mut axes = vec![
             egui_plot::AxisHints::new_y()
                 .label(main_label)
@@ -873,7 +901,7 @@ impl Scale {
         if self.http.is_some() {
             axes.push(
                 egui_plot::AxisHints::new_y()
-                    .label("HTTP")
+                    .label(title("HTTP request (ms)"))
                     .placement(egui_plot::HPlacement::Right)
                     .formatter(move |m, _| fmt_ms(me.http_ms(m.value)))
                     .min_thickness(48.0),
@@ -902,6 +930,20 @@ fn swatch(ui: &mut egui::Ui, color: Color32, dashed: bool) {
     } else {
         ui.painter().line_segment([a, b], stroke);
     }
+}
+
+/// The latest note before `x` (within a few hours), with how long before.
+fn note_line(ui: &mut egui::Ui, notes: &[Note], x: f64) {
+    let ms = (x * 1000.0) as i64;
+    let Some(n) = notes.iter().rev().find(|n| n.ts_ms <= ms && ms - n.ts_ms < 4 * 3_600_000) else { return };
+    let ago = (ms - n.ts_ms) / 60_000;
+    let when = if ago == 0 { "just before".to_string() } else { format!("{} earlier", fmt_duration(ago as f64 * 60.0)) };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.weak("Note:");
+        ui.label(RichText::new(&n.text).strong());
+        ui.weak(format!("({when})"));
+    });
 }
 
 /// Where an HTTP request's time went, as a stacked bar with values.
@@ -1221,7 +1263,7 @@ impl ViewerApp {
             show_http: self.show_http,
             reference: self.reference.clone(),
             // without positions there is no map to show: keep the saved choice
-            map: if self.has_fixes { self.map.is_some() } else { self.saved_prefs.map },
+            map: self.map.is_some(),
             color_by: self.map.as_ref().map_or(self.saved_prefs.color_by, |m| m.color_by()),
         };
         if prefs != self.saved_prefs {
@@ -1299,8 +1341,12 @@ impl ViewerApp {
             segments: &self.segments,
             quality: &quality,
             max_gap_ms: self.max_gap_ms,
+            ever: self.has_fixes,
         };
-        let clicked = map.ui(ui, &input);
+        let (clicked, setup) = map.ui(ui, &input);
+        if setup {
+            crate::tray::open_settings_tab(&self.config_path, "positions");
+        }
         self.map = Some(map);
         if let Some(t) = clicked {
             // centre the charts on the clicked moment

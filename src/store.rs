@@ -19,6 +19,13 @@ pub struct TargetRow {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub text: String,
+}
+
 /// Percentiles kept per bucket, SmokePing style.
 /// Every 5 %, so that the smoke can fade smoothly.
 pub const PCTS: [f64; 21] = [
@@ -49,7 +56,7 @@ impl Bucket {
 }
 
 /// Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
@@ -132,6 +139,17 @@ impl Store {
                      PRIMARY KEY (target_id, ts_ms)
                  ) WITHOUT ROWID;
                  COMMIT;",
+            )?;
+        }
+        if version < 4 {
+            self.conn.execute_batch(
+                "-- what the graph cannot know: 'crowded train', 'Wi-Fi on board'...
+                 CREATE TABLE IF NOT EXISTS note (
+                     id    INTEGER PRIMARY KEY,
+                     ts_ms INTEGER NOT NULL,
+                     text  TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS note_ts ON note(ts_ms);",
             )?;
         }
         if version < SCHEMA_VERSION {
@@ -316,6 +334,40 @@ impl Store {
             flush(&mut out, c, &mut acc);
         }
         Ok(out)
+    }
+
+    pub fn add_note(&self, ts_ms: i64, text: &str) -> Result<i64> {
+        self.conn.execute("INSERT INTO note(ts_ms, text) VALUES (?1, ?2)", params![ts_ms, text])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn delete_note(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM note WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Notes in `[from_ms, to_ms)`, oldest first: (id, ts_ms, text).
+    pub fn notes(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, ts_ms, text FROM note WHERE ts_ms >= ?1 AND ts_ms < ?2 ORDER BY ts_ms",
+        )?;
+        let rows = stmt.query_map(params![from_ms, to_ms], |r| Ok(Note { id: r.get(0)?, ts_ms: r.get(1)?, text: r.get(2)? }))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn recent_notes(&self, limit: usize) -> Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare_cached("SELECT id, ts_ms, text FROM note ORDER BY ts_ms DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |r| Ok(Note { id: r.get(0)?, ts_ms: r.get(1)?, text: r.get(2)? }))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Distinct texts, most used first, for one-click reuse.
+    pub fn frequent_notes(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT text FROM note GROUP BY text ORDER BY COUNT(*) DESC, MAX(ts_ms) DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn purge_before(&self, ts_ms: i64) -> Result<usize> {
