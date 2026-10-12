@@ -104,6 +104,17 @@ impl Store {
         Ok(())
     }
 
+    /// Raw samples of one target since `from_ms`, oldest first; RTT in ms.
+    pub fn samples_since(&self, target_id: i64, from_ms: i64) -> Result<Vec<(i64, Option<f64>)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ts_ms, rtt_us FROM sample WHERE target_id = ?1 AND ts_ms >= ?2 ORDER BY ts_ms",
+        )?;
+        let rows = stmt.query_map(params![target_id, from_ms], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.map(|us| us as f64 / 1000.0)))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn purge_before(&self, ts_ms: i64) -> Result<usize> {
         Ok(self.conn.execute("DELETE FROM sample WHERE ts_ms < ?1", [ts_ms])?)
     }

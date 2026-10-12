@@ -37,7 +37,9 @@ timeout_ms = 1500
 retention_days = 180
 warn_ms = 60.0
 bad_ms = 200.0
-icon_samples = 16
+icon_columns = 20
+icon_column_secs = 15.0
+icon_height = 20
 
 [[target]]
 name = "UCLouvain"

@@ -2669,6 +2669,7 @@ dependencies = [
  "eframe",
  "egui_plot",
  "ksni",
+ "png",
  "rusqlite",
  "serde",
  "surge-ping",

@@ -4,14 +4,15 @@
 
 use std::path::PathBuf;
 
-use crate::icon::{Bar, Thresholds};
-
-/// What the tray shows; rebuilt by the collector after every sample.
-#[derive(Clone)]
+/// What the tray shows; rebuilt by the collector.
+#[derive(Clone, Default)]
 pub struct TrayState {
-    pub bars: Vec<Bar>,
+    /// Wide PNG of the icon. GNOME's AppIndicator extension only keeps the
+    /// aspect ratio of icons given as files; raw pixmaps are squashed square.
+    pub icon_file: Option<PathBuf>,
+    /// The same image as ARGB32, for hosts that ignore file icons.
+    pub pixmap: (usize, usize, Vec<u8>),
     pub tooltip: String,
-    pub thresholds: Thresholds,
     pub config_path: PathBuf,
 }
 
@@ -56,15 +57,17 @@ mod sni {
         fn title(&self) -> String {
             "pingtray".into()
         }
+        fn icon_name(&self) -> String {
+            // an absolute path: not in the spec, but the AppIndicator extension
+            // and others accept it
+            self.0.icon_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-            [32, 64]
-                .into_iter()
-                .map(|size| ksni::Icon {
-                    width: size as i32,
-                    height: size as i32,
-                    data: crate::icon::render_argb(&self.0.bars, size, self.0.thresholds),
-                })
-                .collect()
+            let (w, h, data) = &self.0.pixmap;
+            if data.is_empty() {
+                return Vec::new();
+            }
+            vec![ksni::Icon { width: *w as i32, height: *h as i32, data: data.clone() }]
         }
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
@@ -130,15 +133,10 @@ impl TrayHandle {
         None
     }
 
-    pub async fn update(&self, bars: Vec<Bar>, tooltip: String) {
+    pub async fn update(&self, state: TrayState) {
         #[cfg(target_os = "linux")]
-        self.inner
-            .update(move |t| {
-                t.0.bars = bars;
-                t.0.tooltip = tooltip;
-            })
-            .await;
+        self.inner.update(move |t| t.0 = state).await;
         #[cfg(not(target_os = "linux"))]
-        let _ = (bars, tooltip);
+        let _ = state;
     }
 }

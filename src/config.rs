@@ -18,8 +18,11 @@ retention_days = 180
 # Colour thresholds for the tray icon, in milliseconds.
 warn_ms = 60.0
 bad_ms = 200.0
-# Number of bars in the tray icon (one per ping, worst target wins).
-icon_samples = 16
+# Tray graph: number of columns, seconds per column (all targets pooled),
+# and icon height in pixels.
+icon_columns = 20
+icon_column_secs = 15.0
+icon_height = 20
 
 [[target]]
 name = "Google DNS"
@@ -38,7 +41,9 @@ pub struct Config {
     pub retention_days: u32,
     pub warn_ms: f64,
     pub bad_ms: f64,
-    pub icon_samples: usize,
+    pub icon_columns: usize,
+    pub icon_column_secs: f64,
+    pub icon_height: usize,
     #[serde(rename = "target")]
     pub targets: Vec<Target>,
 }
@@ -59,7 +64,9 @@ impl Default for Config {
             retention_days: 180,
             warn_ms: 60.0,
             bad_ms: 200.0,
-            icon_samples: 16,
+            icon_columns: 20,
+            icon_column_secs: 15.0,
+            icon_height: 20,
             targets: Vec::new(),
         }
     }
@@ -79,7 +86,9 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.interval_secs = cfg.interval_secs.max(0.2);
-        cfg.icon_samples = cfg.icon_samples.clamp(4, 64);
+        cfg.icon_columns = cfg.icon_columns.clamp(4, 120);
+        cfg.icon_column_secs = cfg.icon_column_secs.max(cfg.interval_secs);
+        cfg.icon_height = cfg.icon_height.clamp(9, 128);
         Ok(cfg)
     }
 
@@ -110,4 +119,9 @@ pub fn data_dir() -> PathBuf {
 
 pub fn db_path() -> PathBuf {
     data_dir().join("pingtray.sqlite")
+}
+
+/// Per-session scratch space (icons); falls back to the data dir.
+pub fn runtime_dir() -> PathBuf {
+    dirs().runtime_dir().map(Path::to_path_buf).unwrap_or_else(data_dir)
 }
