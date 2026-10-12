@@ -527,6 +527,8 @@ impl ViewerApp {
                 log_y,
             );
             let (y_min, y_max) = scale.bounds();
+            // the hovered curve (last frame) and its axis
+            let focus = highlight.and_then(|id| series.iter().find(|s| s.id() == id)).map(|s| (s.http, s.t.color));
             let last = i + 1 == n;
             // with several targets on one chart, loss colours would be ambiguous
             let loss_colours = self.loss_colours && series.len() == 1;
@@ -539,7 +541,7 @@ impl ViewerApp {
                 .show_axes([last, true])
                 .x_grid_spacer(time_grid)
                 .x_axis_formatter(|m, _| fmt_axis(m))
-                .custom_y_axes(scale.axes())
+                .custom_y_axes(scale.axes(focus, ui.visuals().weak_text_color()))
                 .y_grid_spacer(value_grid)
                 // our own tooltip below, richer than the plot's text label
                 .show_x(false)
@@ -589,6 +591,15 @@ impl ViewerApp {
                 }
                 (pui.plot_bounds(), pui.pointer_coordinate())
             });
+            if let Some((http, c)) = focus {
+                // a bar along the edge of the hovered curve's axis
+                let frame = *r.transform.frame();
+                let x = if scale.on_right(http) { frame.right() } else { frame.left() };
+                ui.painter().line_segment(
+                    [egui::pos2(x, frame.top()), egui::pos2(x, frame.bottom())],
+                    egui::Stroke::new(3.0, c),
+                );
+            }
             if r.response.dragged() {
                 dragged_to = Some((r.inner.0.min()[0], r.inner.0.max()[0]));
             }
@@ -888,24 +899,40 @@ impl Scale {
         }
     }
 
-    fn axes<'a>(&self) -> Vec<egui_plot::AxisHints<'a>> {
+    /// Whether a series of this kind is read on the right axis.
+    fn on_right(&self, http: bool) -> bool {
+        http && self.http.is_some()
+    }
+
+    /// Axes; `focus` (kind, colour) is the hovered curve: its axis takes the
+    /// curve's colour, the other one steps back.
+    fn axes<'a>(&self, focus: Option<(bool, Color32)>, weak: Color32) -> Vec<egui_plot::AxisHints<'a>> {
         let me = *self;
-        let title = |t: &str| RichText::new(t).strong();
-        let main_label = title(if self.main_is_http { "HTTP request (ms)" } else { "ICMP ping (ms)" });
-        let mut axes = vec![
-            egui_plot::AxisHints::new_y()
-                .label(main_label)
-                .formatter(move |m, _| fmt_ms(me.ms(m.value)))
-                .min_thickness(48.0),
-        ];
+        let style = |hint: egui_plot::AxisHints<'a>, text: &str, right: bool| {
+            let title = RichText::new(text).strong();
+            match focus {
+                Some((http, c)) if me.on_right(http) == right => {
+                    hint.label(title.color(c).size(15.0)).tick_label_color(c)
+                }
+                Some(_) => hint.label(title.color(weak)).tick_label_color(weak),
+                None => hint.label(title),
+            }
+        };
+        let main = if self.main_is_http { "HTTP request (ms)" } else { "ICMP ping (ms)" };
+        let mut axes = vec![style(
+            egui_plot::AxisHints::new_y().formatter(move |m, _| fmt_ms(me.ms(m.value))).min_thickness(48.0),
+            main,
+            false,
+        )];
         if self.http.is_some() {
-            axes.push(
+            axes.push(style(
                 egui_plot::AxisHints::new_y()
-                    .label(title("HTTP request (ms)"))
                     .placement(egui_plot::HPlacement::Right)
                     .formatter(move |m, _| fmt_ms(me.http_ms(m.value)))
                     .min_thickness(48.0),
-            );
+                "HTTP request (ms)",
+                true,
+            ));
         }
         axes
     }
