@@ -4,11 +4,14 @@ Network latency at a glance: a tiny bar graph in the system tray, the full
 history (minutes to months, zoomable and scrollable) one click away.
 
 - Pings a few hosts you configure, every 2 s by default, with unprivileged ICMP.
-- Tray icon: one bar per ping, the worst target wins. Height is log-scaled
-  (1 ms to 1 s), colour is green / yellow / orange by threshold, a full red
-  bar means a lost ping. The tooltip lists each target with its loss over 5 min.
-- Click the icon (or *Show graph* in its menu) for the graph window: reply
-  time per target with a min/max band, and packet loss underneath.
+- Tray icon: the current median in ms (yellow / orange above the thresholds,
+  red `--` when nothing comes back), then a SmokePing-style mini graph of the
+  last 5 minutes, one column per 15 s, all targets pooled. The tooltip lists
+  each target and gives the scale.
+- Click the icon (or *Show graph* in its menu) for the graph window, drawn
+  like SmokePing: one chart per target, grey smoke for the spread of the
+  pings (min-max, 10-90 %, 25-75 %), the median as a line coloured by loss,
+  red shading where everything was lost.
 - History lives in SQLite, so the graph covers everything since the first run
   (180 days by default).
 
