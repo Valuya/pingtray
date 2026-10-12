@@ -251,35 +251,37 @@ pub fn rgba_to_argb(mut px: Vec<u8>) -> Vec<u8> {
     px
 }
 
-/// Writes the icon as PNG under a fresh name (GNOME caches icons by path) and
-/// removes the previous files.
-pub struct PngSink {
+/// Writes icons under fresh names (GNOME caches icons by path) and removes
+/// the previous files.
+pub struct IconSink {
     dir: PathBuf,
     counter: u64,
 }
 
-impl PngSink {
-    pub fn new(dir: &Path) -> std::io::Result<PngSink> {
+impl IconSink {
+    pub fn new(dir: &Path) -> std::io::Result<IconSink> {
         std::fs::create_dir_all(dir)?;
         for entry in std::fs::read_dir(dir)?.flatten() {
             let _ = std::fs::remove_file(entry.path());
         }
-        Ok(PngSink { dir: dir.to_path_buf(), counter: 0 })
+        Ok(IconSink { dir: dir.to_path_buf(), counter: 0 })
     }
 
-    pub fn write(&mut self, w: usize, h: usize, rgba: &[u8]) -> std::io::Result<PathBuf> {
+    pub fn write_svg(&mut self, svg: &str) -> std::io::Result<PathBuf> {
         self.counter += 1;
-        let path = self.dir.join(format!("icon-{}.png", self.counter));
-        let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
-        let mut enc = png::Encoder::new(file, w as u32, h as u32);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.write_header()?.write_image_data(rgba)?;
-        // keep the previous one: the shell may still be loading it
-        if self.counter > 2 {
-            let _ = std::fs::remove_file(self.dir.join(format!("icon-{}.png", self.counter - 2)));
-        }
+        let path = self.dir.join(format!("icon-{}.svg", self.counter));
+        std::fs::write(&path, svg)?;
+        self.forget_old();
         Ok(path)
+    }
+
+    /// Keeps the previous file: the shell may still be loading it.
+    fn forget_old(&self) {
+        if self.counter > 2 {
+            for ext in ["png", "svg"] {
+                let _ = std::fs::remove_file(self.dir.join(format!("icon-{}.{ext}", self.counter - 2)));
+            }
+        }
     }
 }
 

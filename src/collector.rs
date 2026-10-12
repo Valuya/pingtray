@@ -9,7 +9,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config};
-use crate::icon::{self, Column, Current, IconData, PngSink, Thresholds};
+use crate::icon::{self, Column, Current, IconData, IconSink, Thresholds};
 use crate::pinger::{self, Kind, Sample};
 use crate::store::Store;
 use crate::tray::{TrayHandle, TrayState};
@@ -143,7 +143,7 @@ impl Live {
 
 struct TrayFeed {
     handle: TrayHandle,
-    sink: Option<PngSink>,
+    sink: Option<IconSink>,
     base: TrayState,
     thresholds: Thresholds,
     height: usize,
@@ -159,8 +159,9 @@ impl TrayFeed {
         let which = crate::tray::selected_target(&self.base.selection);
         let data = live.icon_data(pinger::now_ms(), which);
         let (w, h, rgba) = icon::render(&data, self.height, self.thresholds);
+        let svg = crate::svg_icon::ping(&data, self.height as f64, self.thresholds);
         let icon_file = self.sink.as_mut().and_then(|s| {
-            s.write(w, h, &rgba).map_err(|e| tracing::warn!("writing icon: {e}")).ok()
+            s.write_svg(&svg).map_err(|e| tracing::warn!("writing icon: {e}")).ok()
         });
         let state = TrayState {
             icon_file,
@@ -224,14 +225,15 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let base = PowerTrayState { paused: paused.clone(), config_path: config_path.to_path_buf(), threshold: 80, ..Default::default() };
     let handle = if with_tray { PowerTrayHandle::spawn(base.clone()).await } else { None };
-    let mut sink = PngSink::new(&config::runtime_dir().join("power-icons")).ok();
+    let mut sink = IconSink::new(&config::runtime_dir().join("power-icons")).ok();
     let rt = tokio::runtime::Handle::current();
     let height = cfg.icon_height;
     crate::power::spawn(cfg.power.clone(), cfg.location.max_gap_ms(), paused, move |s: &Status| {
         let Some(handle) = &handle else { return };
         let b = s.battery;
         let (w, h, rgba) = icon::render_battery(b.percentage, b.preserve, b.end_threshold, b.charging, height);
-        let icon_file = sink.as_mut().and_then(|k| k.write(w, h, &rgba).ok());
+        let svg = crate::svg_icon::battery(b.percentage, b.preserve, b.end_threshold, b.charging, height as f64);
+        let icon_file = sink.as_mut().and_then(|k| k.write_svg(&svg).ok());
         let mode = if b.preserve {
             format!("Preserve battery health: stops at {} %", b.end_threshold)
         } else {
@@ -325,7 +327,7 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
             ..Default::default()
         };
         if let Some(handle) = TrayHandle::spawn(base.clone()).await {
-            let sink = PngSink::new(&config::runtime_dir().join("icons"))
+            let sink = IconSink::new(&config::runtime_dir().join("icons"))
                 .map_err(|e| tracing::warn!("icon directory: {e}"))
                 .ok();
             let thresholds = Thresholds { warn_ms: cfg.warn_ms, bad_ms: cfg.bad_ms };

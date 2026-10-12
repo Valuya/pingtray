@@ -10,6 +10,7 @@ mod power;
 mod settings;
 mod smoke;
 mod store;
+mod svg_icon;
 mod transport;
 mod tray;
 mod viewer;
