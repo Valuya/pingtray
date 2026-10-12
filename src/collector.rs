@@ -161,6 +161,50 @@ impl TrayFeed {
     }
 }
 
+/// Set in the environment of a collector restarted for new settings.
+pub const RESTARTED: &str = "PINGTRAY_RESTARTED";
+
+fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Restarts this process (same arguments) when the config file changes:
+/// simpler and safer than reconfiguring pingers, endpoint and tray live.
+fn watch_config(path: PathBuf) {
+    std::thread::spawn(move || {
+        let start = modified(&path);
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let now = modified(&path);
+            if now.is_some() && now != start {
+                // let the writer finish
+                std::thread::sleep(Duration::from_millis(300));
+                if let Err(e) = Config::load(&path) {
+                    tracing::error!("new settings not applied: {e}");
+                    continue;
+                }
+                tracing::info!("settings changed, restarting");
+                restart();
+            }
+        }
+    });
+}
+
+fn restart() {
+    let Ok(exe) = crate::tray::own_exe() else { return };
+    // a new process, not exec(): the tray is registered on D-Bus under a name
+    // containing the PID, and reusing it confuses the panel
+    let started = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(RESTARTED, "1")
+        .spawn();
+    match started {
+        // the new one waits for our lock, released on exit
+        Ok(_) => std::process::exit(0),
+        Err(e) => tracing::error!("restart failed: {e}"),
+    }
+}
+
 /// Phone positions: HTTP endpoint and watched folder, when configured.
 fn start_location_inputs(cfg: &Config) {
     let loc = &cfg.location;
@@ -192,6 +236,7 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
         .collect::<Result<Vec<_>>>()?;
 
     start_location_inputs(&cfg);
+    watch_config(config_path.clone());
 
     let (tx, mut rx) = mpsc::channel::<Sample>(256);
     pinger::spawn_all(cfg.clone(), tx)?;

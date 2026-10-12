@@ -29,31 +29,37 @@ Ubuntu). KDE, XFCE and most wlroots bars support it natively.
 Linux needs unprivileged ICMP, which most distributions allow:
 `sysctl net.ipv4.ping_group_range` must include your group.
 
-## Configuration
+## Settings
 
-`~/.config/pingtray/config.toml`, created on first start. Targets are keyed by
-name: rename one and its history starts afresh.
+*Settings…* in the tray menu (or ⚙ in the graph window) opens the settings
+window: destinations, ping timing, tray graph, phone positions. Saving
+applies the changes at once (pingtray restarts itself).
 
-```toml
-interval_secs = 2.0
-timeout_ms = 1500
-retention_days = 180
-warn_ms = 60.0
-bad_ms = 200.0
-icon_columns = 20
-icon_column_secs = 15.0
-icon_height = 20
+They are stored in `~/.config/pingtray/config.toml`. History is kept per
+destination name: renaming one starts a new history.
 
-[[target]]
-name = "UCLouvain"
-host = "130.104.1.1"
+## Phone positions
 
-[[target]]
-name = "Google DNS"
-host = "8.8.8.8"
-```
+Turn on *Receive positions from my phone* in the settings; the window then
+shows the URL to enter in the phone app:
 
-Host names are resolved every 5 minutes, IPv4 preferred.
+- **OwnTracks** (Android, iOS): mode HTTP, the URL shown, any user name,
+  the token as password.
+- **GPSLogger** (Android): *Log to custom URL* with the URL shown.
+
+The phone has to reach this computer (same Wi-Fi, or the laptop tethered on
+the phone). Otherwise let the app write GPX or CSV files to a folder synced
+to the laptop and pick that folder in *Import position files from a folder*;
+`pingtray import FILE…` loads files by hand.
+
+Each ping is then placed between the positions around it. The map shows
+the uncertainty: accuracy discs around each fix, fainter lines where the
+fix was vague, and a circle sized to the uncertainty at the moment under
+the mouse (accuracy plus the leeway of interpolating between fixes).
+
+The transport mode is guessed from speed patterns, then from the distance
+to OpenStreetMap railways (fetched from Overpass, cached per tile) to tell
+trains and trams from cars. `pingtray trips` lists the journeys.
 
 ## Commands
 
@@ -62,6 +68,9 @@ Host names are resolved every 5 minutes, IPv4 preferred.
 | `pingtray` / `pingtray run` | ping, record, show the tray icon |
 | `pingtray collect` | same without icon (server, unsupported desktop) |
 | `pingtray view` | graph window |
+| `pingtray settings` | settings window |
+| `pingtray import FILE…` | load positions (GPX, CSV, OwnTracks .rec, GeoJSON) |
+| `pingtray trips [--hours N]` | journeys with their transport mode |
 | `pingtray autostart [--remove]` | XDG autostart entry |
 
 ## Graph window
@@ -93,9 +102,5 @@ ping.
 ## Roadmap
 
 1. ~~Tray graph and history window.~~
-2. Location for each sample, from the phone's GPS (e.g. OwnTracks or
-   GPSLogger posting to a small endpoint), stored in its own table and joined
-   on time.
-3. Map view of latency and loss along the way.
-4. Transport mode guess (foot, bike, car, train) from speed, acceleration
-   and proximity to railway lines.
+2. ~~Positions from the phone, map, transport mode.~~
+3. Windows/macOS tray backend (`tray-icon` crate).

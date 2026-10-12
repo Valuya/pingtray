@@ -53,31 +53,32 @@ fn save_selection(choices: &[String], value: usize) {
 
 /// Opens the big graph window in a separate process, so the tray stays light.
 pub fn open_viewer(config_path: &std::path::Path) {
-    let exe = match std::env::current_exe() {
-        // after `cargo install` replaced us, Linux reports "<path> (deleted)":
-        // launch the new binary at the same path
-        Ok(p) => match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-            Some(s) => PathBuf::from(s),
-            None => p,
-        },
+    spawn_self(config_path, "view");
+}
+
+pub fn open_settings(config_path: &std::path::Path) {
+    spawn_self(config_path, "settings");
+}
+
+/// This program's path, also after `cargo install` replaced the binary
+/// (Linux then reports "<path> (deleted)").
+pub fn own_exe() -> std::io::Result<PathBuf> {
+    let p = std::env::current_exe()?;
+    Ok(match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    })
+}
+
+fn spawn_self(config_path: &std::path::Path, command: &str) {
+    let exe = match own_exe() {
+        Ok(p) => p,
         Err(e) => return tracing::error!("cannot locate own executable: {e}"),
     };
-    match std::process::Command::new(exe).arg("--config").arg(config_path).arg("view").spawn() {
+    match std::process::Command::new(exe).arg("--config").arg(config_path).arg(command).spawn() {
         // reap the child so it does not linger as a zombie
         Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
         Err(e) => tracing::error!("cannot start viewer: {e}"),
-    }
-}
-
-fn open_in_editor(path: &std::path::Path) {
-    #[cfg(target_os = "linux")]
-    let opener = "xdg-open";
-    #[cfg(target_os = "macos")]
-    let opener = "open";
-    #[cfg(windows)]
-    let opener = "explorer";
-    if let Ok(mut child) = std::process::Command::new(opener).arg(path).spawn() {
-        std::thread::spawn(move || child.wait());
     }
 }
 
@@ -160,8 +161,8 @@ mod sni {
                 }
                 .into(),
                 StandardItem {
-                    label: "Edit configuration".into(),
-                    activate: Box::new(|t: &mut Self| open_in_editor(&t.0.config_path)),
+                    label: "Settings…".into(),
+                    activate: Box::new(|t: &mut Self| open_settings(&t.0.config_path)),
                     ..Default::default()
                 }
                 .into(),

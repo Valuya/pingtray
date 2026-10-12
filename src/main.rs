@@ -5,6 +5,7 @@ mod icon;
 mod location;
 mod map;
 mod pinger;
+mod settings;
 mod store;
 mod transport;
 mod tray;
@@ -35,6 +36,8 @@ enum Command {
     Collect,
     /// Open the graph window.
     View,
+    /// Open the settings window.
+    Settings,
     /// Import positions from GPX, CSV, OwnTracks .rec or JSON files.
     Import {
         files: Vec<PathBuf>,
@@ -54,14 +57,20 @@ enum Command {
 }
 
 /// Holds an exclusive lock on `name` in the data dir for the life of the process.
+/// After a restart for new settings, the old process may hold the lock a
+/// moment longer: wait for it then.
 fn single_instance(name: &str) -> Result<Option<File>> {
     let path = config::data_dir().join(name);
     let file = File::create(&path).with_context(|| path.display().to_string())?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    let patience = if std::env::var_os(collector::RESTARTED).is_some() { 50 } else { 1 };
+    for _ in 0..patience {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
+    Ok(None)
 }
 
 fn autostart(remove: bool, config_path: &std::path::Path) -> Result<()> {
@@ -121,9 +130,16 @@ fn main() -> Result<()> {
                 tracing::info!("viewer already open");
                 return Ok(());
             };
-            viewer::run(cfg)
+            viewer::run(cfg, config_path)
         }
         Command::Autostart { remove } => autostart(remove, &config_path),
+        Command::Settings => {
+            let Some(_lock) = single_instance("settings.lock")? else {
+                tracing::info!("settings already open");
+                return Ok(());
+            };
+            settings::run(cfg, config_path)
+        }
         Command::Trips { hours } => {
             let store = store::Store::open(&config::db_path())?;
             let now = pinger::now_ms();

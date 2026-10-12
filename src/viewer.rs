@@ -93,6 +93,7 @@ enum Msg {
 
 pub struct ViewerApp {
     interval_secs: f64,
+    config_path: PathBuf,
     thresholds: Thresholds,
     max_gap_ms: i64,
     targets: Vec<TargetView>,
@@ -189,7 +190,7 @@ fn spawn_worker(db: PathBuf, max_gap_ms: i64, ctx: egui::Context) -> (mpsc::Send
 }
 
 impl ViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config, db: PathBuf) -> anyhow::Result<Self> {
+    pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config, config_path: PathBuf, db: PathBuf) -> anyhow::Result<Self> {
         let store = Store::open(&db)?;
         // Configured targets first, in config order; former targets after, hidden.
         let rows = store.targets()?;
@@ -215,6 +216,7 @@ impl ViewerApp {
         let now = now_ms() as f64 / 1000.0;
         Ok(ViewerApp {
             interval_secs: cfg.interval_secs,
+            config_path,
             thresholds: Thresholds { warn_ms: cfg.warn_ms, bad_ms: cfg.bad_ms },
             max_gap_ms,
             targets,
@@ -294,6 +296,9 @@ impl ViewerApp {
                     self.follow = true;
                 }
             ui.separator();
+            if ui.button("⚙").on_hover_text("Settings").clicked() {
+                crate::tray::open_settings(&self.config_path);
+            }
             ui.checkbox(&mut self.follow, "Live");
             ui.checkbox(&mut self.log_y, "Log scale");
             ui.checkbox(&mut self.split, "Split").on_hover_text("One chart per target");
@@ -808,7 +813,7 @@ fn fmt_duration(s: f64) -> String {
     }
 }
 
-pub fn run(cfg: Config) -> anyhow::Result<()> {
+pub fn run(cfg: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let db = crate::config::db_path();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -820,7 +825,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     eframe::run_native(
         "pingtray",
         options,
-        Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, cfg, db)?))),
+        Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, cfg, config_path, db)?))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -845,36 +850,7 @@ impl ViewerApp {
 
     fn snapshot_step(&mut self, ui: &egui::Ui) {
         let loaded = self.loaded.is_some();
-        let Some((path, frames)) = &mut self.snapshot else { return };
-        let ctx = ui.ctx().clone();
-        *frames += 1;
-        // PINGTRAY_SNAPSHOT_SECS: let tiles and data arrive first (default 3 s)
-        let wait: f64 = std::env::var("PINGTRAY_SNAPSHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
-        let ready = loaded && ui.input(|i| i.time) >= wait;
-        if ready && *frames % 20 == 0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-        }
-        let shot = ui.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        if let Some(img) = shot {
-            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-            let [w, h] = img.size;
-            let res = std::fs::File::create(&*path).map_err(anyhow::Error::from).and_then(|f| {
-                let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
-                enc.set_color(png::ColorType::Rgba);
-                enc.write_header()?.write_image_data(&rgba)?;
-                Ok(())
-            });
-            if let Err(e) = res {
-                tracing::error!("snapshot: {e}");
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        ctx.request_repaint();
+        snapshot_step(ui, &mut self.snapshot, loaded);
     }
 }
 
@@ -949,4 +925,37 @@ impl ViewerApp {
             self.follow = false;
         }
     }
+}
+
+/// Debug aid shared by the windows: with PINGTRAY_SNAPSHOT=file.png, save a
+/// screenshot once `ready` and PINGTRAY_SNAPSHOT_SECS (default 3) passed, then quit.
+pub fn snapshot_step(ui: &egui::Ui, snapshot: &mut Option<(PathBuf, u32)>, ready: bool) {
+    let Some((path, frames)) = snapshot else { return };
+    let ctx = ui.ctx().clone();
+    *frames += 1;
+    let wait: f64 = std::env::var("PINGTRAY_SNAPSHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+    if ready && ui.input(|i| i.time) >= wait && *frames % 20 == 0 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+    }
+    let shot = ui.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+    });
+    if let Some(img) = shot {
+        let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+        let [w, h] = img.size;
+        let res = std::fs::File::create(&*path).map_err(anyhow::Error::from).and_then(|f| {
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
+            enc.set_color(png::ColorType::Rgba);
+            enc.write_header()?.write_image_data(&rgba)?;
+            Ok(())
+        });
+        if let Err(e) = res {
+            tracing::error!("snapshot: {e}");
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    ctx.request_repaint();
 }
