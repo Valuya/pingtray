@@ -82,6 +82,10 @@ fn glyph(c: char) -> [u8; GLYPH_H] {
         '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c],
         'k' => [0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12],
         '?' => [0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04],
+        'M' => [0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11],
+        'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        'X' => [0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11],
+        '%' => [0x19, 0x1a, 0x02, 0x04, 0x08, 0x0b, 0x13],
         _ => [0; GLYPH_H],
     }
 }
@@ -202,6 +206,44 @@ pub fn render(data: &IconData, height: usize, th: Thresholds) -> (usize, usize, 
     (c.w, c.h, c.px)
 }
 
+/// Battery icon for the charging mode: the charge level in a battery
+/// outline, a mark at the threshold when preserving, and the mode as text
+/// ("MAX", or the threshold like "80%"). Monochrome: colours mean
+/// connection quality in the other icon.
+pub fn render_battery(percentage: f64, preserve: bool, threshold: u32, charging: bool, height: usize) -> (usize, usize, Vec<u8>) {
+    let h = height.max(GLYPH_H + 2);
+    let scale = ((h - 2) / GLYPH_H).max(1);
+    let body_h = (h * 3 / 5).max(6);
+    let body_w = body_h * 2;
+    let top = (h - body_h) / 2;
+    let label = if preserve { format!("{threshold}%") } else { "MAX".to_string() };
+    let text_w = label.chars().count() * (GLYPH_W + 1) * scale - scale;
+    let gap = scale * 2;
+    let nub = (body_h / 5).max(2);
+    let w = body_w + nub + gap + text_w + scale; // a little room after the text
+    let mut c = Canvas::new(w, h);
+    let white = [0xf6, 0xf5, 0xf4];
+    let grey = [0x9a, 0x99, 0x96];
+    // outline
+    c.rect(0, top, body_w, top + 1, white, 0xff);
+    c.rect(0, top + body_h - 1, body_w, top + body_h, white, 0xff);
+    c.rect(0, top, 1, top + body_h, white, 0xff);
+    c.rect(body_w - 1, top, body_w, top + body_h, white, 0xff);
+    c.rect(body_w, top + body_h / 3, body_w + nub, top + body_h - body_h / 3, white, 0xff);
+    // charge level, brighter while charging
+    let inner = body_w - 4;
+    let fill = ((percentage.clamp(0.0, 100.0) / 100.0) * inner as f64).round() as usize;
+    c.rect(2, top + 2, 2 + fill, top + body_h - 2, if charging { white } else { grey }, 0xff);
+    if preserve {
+        // where charging stops
+        let x = 2 + (threshold.min(100) as usize * inner) / 100;
+        c.rect(x, top - 1.min(top), x + 1, top + body_h + 1, white, 0xff);
+    }
+    let text_y = (h - GLYPH_H * scale) / 2;
+    c.text(&label, w - scale, text_y, scale, white);
+    (c.w, c.h, c.px)
+}
+
 pub fn rgba_to_argb(mut px: Vec<u8>) -> Vec<u8> {
     for p in px.chunks_exact_mut(4) {
         p.rotate_right(1);
@@ -251,6 +293,13 @@ mod tests {
         assert_eq!(c.pcts.unwrap()[2], 20.0);
         assert_eq!(c.loss, 0.25);
         assert!(Column::from_samples(&[None]).pcts.is_none());
+    }
+
+    #[test]
+    fn renders_battery_icon() {
+        let (w, h, px) = render_battery(62.0, true, 80, false, 20);
+        assert_eq!(px.len(), w * h * 4);
+        assert!(w > h);
     }
 
     #[test]

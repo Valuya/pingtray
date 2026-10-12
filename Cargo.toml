@@ -27,3 +27,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.4.2"
 walkers = "0.61.0"
 webpki-roots = { version = "1", default-features = false }
+zbus = "5"

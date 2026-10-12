@@ -53,11 +53,15 @@ fn save_selection(choices: &[String], value: usize) {
 
 /// Opens the big graph window in a separate process, so the tray stays light.
 pub fn open_viewer(config_path: &std::path::Path) {
-    spawn_self(config_path, "view");
+    spawn_self(config_path, &["view"]);
 }
 
 pub fn open_settings(config_path: &std::path::Path) {
-    spawn_self(config_path, "settings");
+    spawn_self(config_path, &["settings"]);
+}
+
+pub fn open_power_settings(config_path: &std::path::Path) {
+    spawn_self(config_path, &["settings", "--tab", "power"]);
 }
 
 /// This program's path, also after `cargo install` replaced the binary
@@ -70,12 +74,12 @@ pub fn own_exe() -> std::io::Result<PathBuf> {
     })
 }
 
-fn spawn_self(config_path: &std::path::Path, command: &str) {
+fn spawn_self(config_path: &std::path::Path, command: &[&str]) {
     let exe = match own_exe() {
         Ok(p) => p,
         Err(e) => return tracing::error!("cannot locate own executable: {e}"),
     };
-    match std::process::Command::new(exe).arg("--config").arg(config_path).arg(command).spawn() {
+    match std::process::Command::new(exe).arg("--config").arg(config_path).args(command).spawn() {
         // reap the child so it does not linger as a zombie
         Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
         Err(e) => tracing::error!("cannot start viewer: {e}"),
@@ -207,6 +211,127 @@ impl TrayHandle {
     }
 
     pub async fn update(&self, state: TrayState) {
+        #[cfg(target_os = "linux")]
+        self.inner.update(move |t| t.0 = state).await;
+        #[cfg(not(target_os = "linux"))]
+        let _ = state;
+    }
+}
+
+/// The charging-mode icon: what the second tray item shows.
+#[derive(Clone, Default)]
+pub struct PowerTrayState {
+    pub icon_file: Option<PathBuf>,
+    pub pixmap: (usize, usize, Vec<u8>),
+    pub status: Vec<String>,
+    pub preserve: bool,
+    pub threshold: u32,
+    /// Shared with the power loop: automatic switching paused from the menu.
+    pub paused: Arc<std::sync::atomic::AtomicBool>,
+    pub config_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+mod power_sni {
+    use super::*;
+    use ksni::TrayMethods;
+
+    pub struct PowerTray(pub PowerTrayState);
+
+    impl ksni::Tray for PowerTray {
+        fn id(&self) -> String {
+            "pingtray-power".into()
+        }
+        fn title(&self) -> String {
+            "pingtray charging".into()
+        }
+        fn icon_name(&self) -> String {
+            self.0.icon_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        }
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            let (w, h, data) = &self.0.pixmap;
+            if data.is_empty() {
+                return Vec::new();
+            }
+            vec![ksni::Icon { width: *w as i32, height: *h as i32, data: data.clone() }]
+        }
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip { title: "Battery charging".into(), description: self.0.status.join("\n"), ..Default::default() }
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem};
+            let mut items: Vec<ksni::MenuItem<Self>> = self
+                .0
+                .status
+                .iter()
+                .map(|line| StandardItem { label: line.replace('_', "__"), enabled: false, ..Default::default() }.into())
+                .collect();
+            items.push(ksni::MenuItem::Separator);
+            items.push(
+                RadioGroup {
+                    selected: usize::from(self.0.preserve),
+                    select: Box::new(|t: &mut Self, i: usize| {
+                        crate::power::set_mode(i == 1);
+                        t.0.preserve = i == 1;
+                    }),
+                    options: vec![
+                        RadioItem { label: "Maximize charge".into(), ..Default::default() },
+                        RadioItem {
+                            label: format!("Preserve battery health ({} %)", self.0.threshold),
+                            ..Default::default()
+                        },
+                    ],
+                }
+                .into(),
+            );
+            items.push(ksni::MenuItem::Separator);
+            items.push(
+                CheckmarkItem {
+                    label: "Switch automatically".into(),
+                    checked: !self.0.paused.load(Ordering::Relaxed),
+                    activate: Box::new(|t: &mut Self| {
+                        let paused = t.0.paused.load(Ordering::Relaxed);
+                        t.0.paused.store(!paused, Ordering::Relaxed);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: "Settings…".into(),
+                    activate: Box::new(|t: &mut Self| open_power_settings(&t.0.config_path)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items
+        }
+    }
+
+    pub async fn spawn(state: PowerTrayState) -> Option<ksni::Handle<PowerTray>> {
+        PowerTray(state).spawn().await.map_err(|e| tracing::warn!("charging icon: {e}")).ok()
+    }
+}
+
+#[derive(Clone)]
+pub struct PowerTrayHandle {
+    #[cfg(target_os = "linux")]
+    inner: ksni::Handle<power_sni::PowerTray>,
+}
+
+impl PowerTrayHandle {
+    #[cfg(target_os = "linux")]
+    pub async fn spawn(state: PowerTrayState) -> Option<PowerTrayHandle> {
+        power_sni::spawn(state).await.map(|inner| PowerTrayHandle { inner })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn spawn(_state: PowerTrayState) -> Option<PowerTrayHandle> {
+        None
+    }
+
+    pub async fn update(&self, state: PowerTrayState) {
         #[cfg(target_os = "linux")]
         self.inner.update(move |t| t.0 = state).await;
         #[cfg(not(target_os = "linux"))]

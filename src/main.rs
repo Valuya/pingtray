@@ -6,6 +6,7 @@ mod icon;
 mod location;
 mod map;
 mod pinger;
+mod power;
 mod settings;
 mod smoke;
 mod store;
@@ -39,7 +40,11 @@ enum Command {
     /// Open the graph window.
     View,
     /// Open the settings window.
-    Settings,
+    Settings {
+        /// Tab to open: destinations, pinging, tray, positions or power.
+        #[arg(long)]
+        tab: Option<String>,
+    },
     /// Import positions from GPX, CSV, OwnTracks .rec or JSON files.
     Import {
         files: Vec<PathBuf>,
@@ -135,12 +140,12 @@ fn main() -> Result<()> {
             viewer::run(cfg, config_path)
         }
         Command::Autostart { remove } => autostart(remove, &config_path),
-        Command::Settings => {
+        Command::Settings { tab } => {
             let Some(_lock) = single_instance("settings.lock")? else {
                 tracing::info!("settings already open");
                 return Ok(());
             };
-            settings::run(cfg, config_path)
+            settings::run(cfg, config_path, tab.as_deref())
         }
         Command::Trips { hours } => {
             let store = store::Store::open(&config::db_path())?;

@@ -217,6 +217,52 @@ fn restart() {
     }
 }
 
+/// Charging mode: the policy loop, and its tray icon.
+async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: bool) {
+    use crate::power::{Action, Status};
+    use crate::tray::{PowerTrayHandle, PowerTrayState};
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let base = PowerTrayState { paused: paused.clone(), config_path: config_path.to_path_buf(), threshold: 80, ..Default::default() };
+    let handle = if with_tray { PowerTrayHandle::spawn(base.clone()).await } else { None };
+    let mut sink = PngSink::new(&config::runtime_dir().join("power-icons")).ok();
+    let rt = tokio::runtime::Handle::current();
+    let height = cfg.icon_height;
+    crate::power::spawn(cfg.power.clone(), cfg.location.max_gap_ms(), paused, move |s: &Status| {
+        let Some(handle) = &handle else { return };
+        let b = s.battery;
+        let (w, h, rgba) = icon::render_battery(b.percentage, b.preserve, b.end_threshold, b.charging, height);
+        let icon_file = sink.as_mut().and_then(|k| k.write(w, h, &rgba).ok());
+        let mode = if b.preserve {
+            format!("Preserve battery health: stops at {} %", b.end_threshold)
+        } else {
+            "Maximize charge: charges to 100 %".to_string()
+        };
+        let power = match (b.plugged, b.charging) {
+            (true, true) => "plugged in, charging",
+            (true, false) => "plugged in",
+            (false, _) => "on battery",
+        };
+        let mut status = vec![format!("Battery {:.0} %, {power}", b.percentage), mode];
+        status.push(match &s.reason {
+            Some(r) => format!("Travelling ({r})"),
+            None => "Not travelling".to_string(),
+        });
+        if let Some((action, why)) = &s.last_action {
+            let what = if *action == Action::Maximize { "Switched to maximize" } else { "Switched to preserve" };
+            status.push(format!("{what}: {why}"));
+        }
+        let state = PowerTrayState {
+            icon_file,
+            pixmap: (w, h, icon::rgba_to_argb(rgba)),
+            status,
+            preserve: b.preserve,
+            threshold: b.end_threshold,
+            ..base.clone()
+        };
+        rt.block_on(handle.update(state));
+    });
+}
+
 /// Phone positions: HTTP endpoint and watched folder, when configured.
 fn start_location_inputs(cfg: &Config) {
     let loc = &cfg.location;
@@ -285,6 +331,10 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
             let thresholds = Thresholds { warn_ms: cfg.warn_ms, bad_ms: cfg.bad_ms };
             tray = Some(TrayFeed { handle, sink, base, thresholds, height: cfg.icon_height, last: None });
         }
+    }
+
+    if cfg.power.enabled {
+        start_power(&cfg, &config_path, with_tray).await;
     }
 
     let retention_ms = cfg.retention_days as i64 * 86_400_000;

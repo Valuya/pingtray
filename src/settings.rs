@@ -11,13 +11,25 @@ use crate::config::{Config, LocationConfig, Target};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:18765";
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Destinations,
+    Pinging,
+    Tray,
+    Positions,
+    Power,
+}
+
 pub struct SettingsApp {
+    tab: Tab,
     path: PathBuf,
     cfg: Config,
     /// Last saved state, to know whether there is anything to save.
     saved: String,
     message: Option<(bool, String)>,
     lan_ip: Option<std::net::IpAddr>,
+    /// Networks connected when the window opened (asking NetworkManager every frame is slow).
+    networks_now: Vec<String>,
     snapshot: Option<(PathBuf, u32)>,
 }
 
@@ -44,11 +56,13 @@ impl SettingsApp {
     pub fn new(cfg: Config, path: PathBuf) -> SettingsApp {
         let saved = serialize(&cfg);
         SettingsApp {
+            tab: Tab::Destinations,
             path,
             cfg,
             saved,
             message: None,
             lan_ip: lan_ip(),
+            networks_now: crate::power::active_networks(),
             snapshot: std::env::var_os("PINGTRAY_SNAPSHOT").map(|p| (PathBuf::from(p), 0)),
         }
     }
@@ -259,6 +273,56 @@ impl SettingsApp {
     }
 }
 
+impl SettingsApp {
+    fn power(&mut self, ui: &mut egui::Ui) {
+        let p = &mut self.cfg.power;
+        ui.checkbox(&mut p.enabled, RichText::new("Manage battery charging").strong());
+        ui.weak(
+            "Switches GNOME's Battery Charging setting between Maximize Charge and Preserve Battery Health, \
+             and shows a battery icon with the current mode in the tray.",
+        );
+        ui.add_space(8.0);
+        ui.add_enabled_ui(p.enabled, |ui| {
+            ui.checkbox(&mut p.maximize_when_travelling, "Maximize charge when plugged in while travelling");
+            ui.weak("Typically: you found a socket on the train and want a full battery.");
+            ui.checkbox(&mut p.preserve_when_unplugged, "Back to Preserve Battery Health when unplugged");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Travelling means").strong());
+            ui.checkbox(&mut p.moving, "Moving in a vehicle, according to the phone's positions (last 10 minutes)");
+            ui.label("Or connected to one of these networks (e.g. the phone's hotspot):");
+            let mut remove = None;
+            for (i, n) in p.networks.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([260.0, 22.0], egui::TextEdit::singleline(n));
+                    if ui.button("Remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                p.networks.remove(i);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("+ Add network").clicked() {
+                    p.networks.push(String::new());
+                }
+                for current in &self.networks_now {
+                    if !p.networks.contains(current)
+                        && ui.button(format!("+ Add current: {current}")).clicked()
+                    {
+                        p.networks.push(current.clone());
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.weak(
+                "pingtray only switches when you plug in, unplug, or start travelling while plugged in: \
+                 a mode you choose by hand (here, in GNOME or from the battery icon) stays until then.",
+            );
+        });
+    }
+}
+
 fn copy_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -294,26 +358,41 @@ impl eframe::App for SettingsApp {
             });
             ui.add_space(4.0);
         });
+        egui::Panel::top("tabs").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (Tab::Destinations, "Destinations"),
+                    (Tab::Pinging, "Pinging"),
+                    (Tab::Tray, "Tray icon"),
+                    (Tab::Positions, "Phone positions"),
+                    (Tab::Power, "Power"),
+                ] {
+                    ui.selectable_value(&mut self.tab, tab, label);
+                }
+            });
+            ui.add_space(2.0);
+        });
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::CollapsingHeader::new(RichText::new("Destinations").strong())
-                    .default_open(true)
-                    .show(ui, |ui| self.destinations(ui));
-                egui::CollapsingHeader::new(RichText::new("Pinging").strong())
-                    .default_open(true)
-                    .show(ui, |ui| self.pinging(ui));
-                egui::CollapsingHeader::new(RichText::new("Tray icon").strong())
-                    .default_open(true)
-                    .show(ui, |ui| self.tray(ui));
-                egui::CollapsingHeader::new(RichText::new("Phone positions").strong())
-                    .default_open(true)
-                    .show(ui, |ui| self.positions(ui));
+            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
+                Tab::Destinations => self.destinations(ui),
+                Tab::Pinging => self.pinging(ui),
+                Tab::Tray => self.tray(ui),
+                Tab::Positions => self.positions(ui),
+                Tab::Power => self.power(ui),
             });
         });
     }
 }
 
-pub fn run(cfg: Config, path: PathBuf) -> anyhow::Result<()> {
+pub fn run(cfg: Config, path: PathBuf, tab: Option<&str>) -> anyhow::Result<()> {
+    let tab = match tab {
+        Some("pinging") => Tab::Pinging,
+        Some("tray") => Tab::Tray,
+        Some("positions") => Tab::Positions,
+        Some("power") => Tab::Power,
+        _ => Tab::Destinations,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("pingtray settings")
@@ -321,7 +400,11 @@ pub fn run(cfg: Config, path: PathBuf) -> anyhow::Result<()> {
             .with_inner_size([640.0, 720.0]),
         ..Default::default()
     };
-    eframe::run_native("pingtray settings", options, Box::new(move |_| Ok(Box::new(SettingsApp::new(cfg, path)))))
+    eframe::run_native("pingtray settings", options, Box::new(move |_| {
+        let mut app = SettingsApp::new(cfg, path);
+        app.tab = tab;
+        Ok(Box::new(app))
+    }))
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 

@@ -60,6 +60,7 @@ pub struct Config {
     #[serde(rename = "target")]
     pub targets: Vec<Target>,
     pub location: LocationConfig,
+    pub power: crate::power::PowerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -89,6 +90,7 @@ impl Default for Config {
             tray_target: None,
             targets: Vec::new(),
             location: LocationConfig::default(),
+            power: crate::power::PowerConfig::default(),
         }
     }
 }

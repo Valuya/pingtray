@@ -3325,6 +3325,7 @@ dependencies = [
  "ureq",
  "walkers",
  "webpki-roots",
+ "zbus",
 ]
 
 [[package]]
