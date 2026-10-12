@@ -12,6 +12,10 @@ history (minutes to months, zoomable and scrollable) one click away.
   like SmokePing: one chart per target, grey smoke for the spread of the
   pings (min-max, 10-90 %, 25-75 %), the median as a line coloured by loss,
   red shading where everything was lost.
+- Optional HTTP probes per destination: a tiny HEAD request on a fresh
+  connection every 10 s, timed phase by phase (DNS, connect, TLS, answer),
+  drawn dashed next to the pings, so you see what browsing actually feels
+  like compared to the raw network.
 - History lives in SQLite, so the graph covers everything since the first run
   (180 days by default).
 

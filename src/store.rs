@@ -15,6 +15,8 @@ pub struct TargetRow {
     pub id: i64,
     pub name: String,
     pub host: String,
+    /// "icmp" (ping) or "http".
+    pub kind: String,
 }
 
 /// Percentiles kept per bucket, SmokePing style.
@@ -46,7 +48,7 @@ impl Bucket {
 }
 
 /// Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
@@ -103,6 +105,34 @@ impl Store {
                  );",
             )?;
         }
+        if version < 3 {
+            // a destination may now have two series: ping and HTTP
+            self.conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE target_v3 (
+                     id   INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     host TEXT NOT NULL,
+                     kind TEXT NOT NULL DEFAULT 'icmp',
+                     UNIQUE (name, kind)
+                 );
+                 INSERT INTO target_v3(id, name, host, kind) SELECT id, name, host, 'icmp' FROM target;
+                 DROP TABLE target;
+                 ALTER TABLE target_v3 RENAME TO target;
+                 -- phases of HTTP probes; the total is in sample.rtt_us
+                 CREATE TABLE IF NOT EXISTS http_detail (
+                     target_id  INTEGER NOT NULL,
+                     ts_ms      INTEGER NOT NULL,
+                     dns_us     INTEGER NOT NULL,
+                     connect_us INTEGER NOT NULL,
+                     tls_us     INTEGER NOT NULL,
+                     wait_us    INTEGER NOT NULL,
+                     status     INTEGER NOT NULL,
+                     PRIMARY KEY (target_id, ts_ms)
+                 ) WITHOUT ROWID;
+                 COMMIT;",
+            )?;
+        }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -110,19 +140,21 @@ impl Store {
     }
 
     /// Returns the id of the target with this name, creating or updating it.
-    pub fn upsert_target(&self, name: &str, host: &str) -> Result<i64> {
+    pub fn upsert_target(&self, name: &str, host: &str, kind: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO target(name, host) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET host = excluded.host",
-            params![name, host],
+            "INSERT INTO target(name, host, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name, kind) DO UPDATE SET host = excluded.host",
+            params![name, host, kind],
         )?;
-        Ok(self.conn.query_row("SELECT id FROM target WHERE name = ?1", [name], |r| r.get(0))?)
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM target WHERE name = ?1 AND kind = ?2", [name, kind], |r| r.get(0))?)
     }
 
     pub fn targets(&self) -> Result<Vec<TargetRow>> {
-        let mut stmt = self.conn.prepare("SELECT id, name, host FROM target ORDER BY id")?;
+        let mut stmt = self.conn.prepare("SELECT id, name, host, kind FROM target ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
-            Ok(TargetRow { id: r.get(0)?, name: r.get(1)?, host: r.get(2)? })
+            Ok(TargetRow { id: r.get(0)?, name: r.get(1)?, host: r.get(2)?, kind: r.get(3)? })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -231,7 +263,62 @@ impl Store {
         )?;
         Ok(())
     }
+    /// (target_id, ts_ms, dns, connect, tls, wait in µs, HTTP status)
+    pub fn insert_http_details(&mut self, rows: &[(i64, i64, [u32; 4], u16)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO http_detail(target_id, ts_ms, dns_us, connect_us, tls_us, wait_us, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (id, ts, p, status) in rows {
+                stmt.execute(params![id, ts, p[0], p[1], p[2], p[3], status])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Median DNS, connect, TLS and wait times (ms) per bucket of an HTTP series.
+    pub fn http_phases(&self, target_id: i64, from_ms: i64, to_ms: i64, bucket_ms: i64) -> Result<Vec<(i64, [f64; 4])>> {
+        let bucket_ms = bucket_ms.max(1);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ts_ms, dns_us, connect_us, tls_us, wait_us FROM http_detail
+             WHERE target_id = ?1 AND ts_ms >= ?2 AND ts_ms < ?3 ORDER BY ts_ms",
+        )?;
+        let mut rows = stmt.query(params![target_id, from_ms, to_ms])?;
+        let mut out = Vec::new();
+        let mut cur: Option<i64> = None;
+        let mut acc: [Vec<f64>; 4] = Default::default();
+        let flush = |out: &mut Vec<(i64, [f64; 4])>, b: i64, acc: &mut [Vec<f64>; 4]| {
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                let m = crate::icon::percentile(v, 0.5);
+                v.clear();
+                m
+            };
+            let p = [med(&mut acc[0]), med(&mut acc[1]), med(&mut acc[2]), med(&mut acc[3])];
+            out.push((b, p));
+        };
+        while let Some(r) = rows.next()? {
+            let ts: i64 = r.get(0)?;
+            let b = ts.div_euclid(bucket_ms) * bucket_ms;
+            if cur.is_some_and(|c| c != b) {
+                flush(&mut out, cur.unwrap(), &mut acc);
+            }
+            cur = Some(b);
+            for (k, v) in acc.iter_mut().enumerate() {
+                v.push(r.get::<_, i64>(k + 1)? as f64 / 1000.0);
+            }
+        }
+        if let Some(c) = cur {
+            flush(&mut out, c, &mut acc);
+        }
+        Ok(out)
+    }
+
     pub fn purge_before(&self, ts_ms: i64) -> Result<usize> {
+        self.conn.execute("DELETE FROM http_detail WHERE ts_ms < ?1", [ts_ms])?;
         Ok(self.conn.execute("DELETE FROM sample WHERE ts_ms < ?1", [ts_ms])?)
     }
 
@@ -294,8 +381,9 @@ mod tests {
         let path = dir.join("t.sqlite");
         let _ = std::fs::remove_file(&path);
         let mut store = Store::open(&path).unwrap();
-        let id = store.upsert_target("a", "1.2.3.4").unwrap();
-        assert_eq!(store.upsert_target("a", "5.6.7.8").unwrap(), id);
+        let id = store.upsert_target("a", "1.2.3.4", "icmp").unwrap();
+        assert_eq!(store.upsert_target("a", "5.6.7.8", "icmp").unwrap(), id);
+        assert_ne!(store.upsert_target("a", "https://a/", "http").unwrap(), id);
         store
             .insert_samples(&[(id, 1000, Some(10_000)), (id, 2000, Some(30_000)), (id, 3000, None), (id, 11_000, None)])
             .unwrap();

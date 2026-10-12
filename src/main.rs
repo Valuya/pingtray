@@ -1,6 +1,7 @@
 mod collector;
 mod colors;
 mod config;
+mod http_probe;
 mod icon;
 mod location;
 mod map;
@@ -156,8 +157,9 @@ fn main() -> Result<()> {
                     .unwrap_or_default()
             };
             for s in segments {
+                let stops = if s.stops > 0 { format!("  {} stops", s.stops) } else { String::new() };
                 println!(
-                    "{} - {}  {:<10} {:>6.1} km  {:>4.0} km/h  {:>4} min",
+                    "{} - {}  {:<10} {:>6.1} km  {:>4.0} km/h  {:>4} min{stops}",
                     t(s.from_ms),
                     t(s.to_ms),
                     s.mode.label(),

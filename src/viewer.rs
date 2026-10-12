@@ -47,13 +47,15 @@ struct Prefs {
     log_y: bool,
     split: bool,
     loss_colours: bool,
+    show_ping: bool,
+    show_http: bool,
     map: bool,
     color_by: ColorBy,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { log_y: false, split: false, loss_colours: false, map: true, color_by: ColorBy::Quality }
+        Prefs { log_y: false, split: false, loss_colours: false, show_ping: true, show_http: true, map: true, color_by: ColorBy::Quality }
     }
 }
 
@@ -65,10 +67,27 @@ fn load_prefs() -> Prefs {
     std::fs::read_to_string(prefs_path()).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
 }
 
+/// One destination: its ping series and, when configured, its HTTP series.
 struct TargetView {
     row: TargetRow,
+    http: Option<TargetRow>,
     color: Color32,
     shown: bool,
+}
+
+/// One drawn series: a destination's ping or HTTP times.
+struct Series<'a> {
+    t: &'a TargetView,
+    http: bool,
+    buckets: &'a Vec<Bucket>,
+    /// HTTP only: median DNS, connect, TLS and wait per bucket.
+    phases: Option<&'a Vec<(i64, [f64; 4])>>,
+}
+
+impl Series<'_> {
+    fn label(&self) -> String {
+        format!("{} {}", self.t.row.name, if self.http { "HTTP" } else { "ping" })
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -84,6 +103,8 @@ struct Answer {
     data: HashMap<i64, Vec<Bucket>>,
     /// Positions around the range, sorted by time.
     fixes: Vec<Fix>,
+    /// HTTP series: median phases per bucket.
+    phases: HashMap<i64, Vec<(i64, [f64; 4])>>,
 }
 
 enum Msg {
@@ -107,6 +128,8 @@ pub struct ViewerApp {
     split: bool,
     /// SmokePing look: grey smoke, median coloured by loss (one target per chart).
     loss_colours: bool,
+    show_ping: bool,
+    show_http: bool,
     loaded: Option<Answer>,
     segments: Vec<Segment>,
     has_fixes: bool,
@@ -180,7 +203,15 @@ fn spawn_worker(db: PathBuf, max_gap_ms: i64, ctx: egui::Context) -> (mpsc::Send
             if !fixes.is_empty() {
                 let _ = modes_tx.send(fixes.clone());
             }
-            if ans_tx.send(Msg::Data(Answer { query: q, data, fixes })).is_err() {
+            let phases = q
+                .ids
+                .iter()
+                .filter_map(|&id| {
+                    let p = store.http_phases(id, q.from_ms, q.to_ms, q.bucket_ms).ok()?;
+                    (!p.is_empty()).then_some((id, p))
+                })
+                .collect();
+            if ans_tx.send(Msg::Data(Answer { query: q, data, fixes, phases })).is_err() {
                 return;
             }
             ctx.request_repaint();
@@ -193,16 +224,19 @@ impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config, config_path: PathBuf, db: PathBuf) -> anyhow::Result<Self> {
         let store = Store::open(&db)?;
         // Configured targets first, in config order; former targets after, hidden.
-        let rows = store.targets()?;
+        let all_rows = store.targets()?;
+        let http_of = |name: &str| all_rows.iter().find(|r| r.kind == "http" && r.name == name).cloned();
+        let rows: Vec<TargetRow> = all_rows.iter().filter(|r| r.kind == "icmp").cloned().collect();
         let mut targets: Vec<TargetView> = Vec::new();
         for t in &cfg.targets {
             if let Some(row) = rows.iter().find(|r| r.name == t.name) {
-                targets.push(TargetView { row: row.clone(), color: Color32::GRAY, shown: true });
+                targets.push(TargetView { row: row.clone(), http: http_of(&row.name), color: Color32::GRAY, shown: true });
             }
         }
         for row in rows {
             if !targets.iter().any(|t| t.row.id == row.id) {
-                targets.push(TargetView { row, color: Color32::GRAY, shown: false });
+                let http = http_of(&row.name);
+                targets.push(TargetView { row, http, color: Color32::GRAY, shown: false });
             }
         }
         for (i, t) in targets.iter_mut().enumerate() {
@@ -226,6 +260,8 @@ impl ViewerApp {
             log_y: prefs.log_y,
             split: prefs.split,
             loss_colours: prefs.loss_colours,
+            show_ping: prefs.show_ping,
+            show_http: prefs.show_http,
             loaded: None,
             segments: Vec::new(),
             has_fixes,
@@ -253,7 +289,16 @@ impl ViewerApp {
     fn request_data(&mut self) {
         let bucket = self.bucket_secs();
         let bucket_ms = (bucket * 1000.0) as i64;
-        let ids: Vec<i64> = self.targets.iter().filter(|t| t.shown).map(|t| t.row.id).collect();
+        let ids: Vec<i64> = self
+            .targets
+            .iter()
+            .filter(|t| t.shown)
+            .flat_map(|t| {
+                let ping = self.show_ping.then_some(t.row.id);
+                let http = t.http.as_ref().filter(|_| self.show_http).map(|h| h.id);
+                ping.into_iter().chain(http)
+            })
+            .collect();
         let covered = self.loaded.as_ref().is_some_and(|a| {
             a.query.bucket_ms == bucket_ms
                 && a.query.ids == ids
@@ -301,6 +346,12 @@ impl ViewerApp {
             }
             ui.checkbox(&mut self.follow, "Live");
             ui.checkbox(&mut self.log_y, "Log scale");
+            ui.checkbox(&mut self.show_ping, "Ping").on_hover_text("ICMP echo: solid lines");
+            if self.targets.iter().any(|t| t.http.is_some()) {
+                ui.checkbox(&mut self.show_http, "HTTP")
+                    .on_hover_text("Tiny HEAD request on a fresh connection: dashed lines");
+            }
+            ui.separator();
             ui.checkbox(&mut self.split, "Split").on_hover_text("One chart per target");
             ui.checkbox(&mut self.loss_colours, "Loss colours")
                 .on_hover_text("SmokePing look: grey smoke, median coloured by packet loss (charts with one target)");
@@ -373,24 +424,31 @@ impl ViewerApp {
             crate::map::mode_strip(ui, &self.segments, view, 48.0);
         }
 
-        let empty = Vec::new();
         for (i, group) in groups.iter().enumerate() {
-            let series: Vec<(&TargetView, &Vec<Bucket>)> =
-                group.iter().map(|t| (*t, answer.data.get(&t.row.id).unwrap_or(&empty))).collect();
+            let series: Vec<Series> = group
+                .iter()
+                .flat_map(|t| {
+                    let ping = answer.data.get(&t.row.id).map(|b| Series { t, http: false, buckets: b, phases: None });
+                    let http = t.http.as_ref().and_then(|h| {
+                        answer.data.get(&h.id).map(|b| Series { t, http: true, buckets: b, phases: answer.phases.get(&h.id) })
+                    });
+                    ping.into_iter().chain(http)
+                })
+                .collect();
             let in_view = |b: &&Bucket| {
                 let x = b.ts_ms as f64 / 1000.0;
                 x + bucket_s >= view.0 && x <= view.1
             };
-            ui.horizontal(|ui| {
-                for (t, buckets) in &series {
-                    let visible: Vec<&Bucket> = buckets.iter().filter(in_view).collect();
-                    header(ui, t, &visible);
-                    ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                for t in group {
+                    let mine: Vec<&Series> = series.iter().filter(|s| std::ptr::eq(s.t, *t)).collect();
+                    header(ui, t, &mine, &in_view);
+                    ui.add_space(14.0);
                 }
             });
-            let all_visible: Vec<&Bucket> =
-                series.iter().flat_map(|(_, b)| b.iter().filter(in_view)).collect();
-            let (y_min, y_max) = y_range(&all_visible, log_y);
+            let per_series: Vec<Vec<&Bucket>> =
+                series.iter().map(|s| s.buckets.iter().filter(in_view).collect()).collect();
+            let (y_min, y_max) = y_range(&per_series, log_y);
             let to_ms = move |y: f64| if log_y { 10f64.powf(y) } else { y };
             let yv = move |ms: f64| if log_y { ms.max(0.1).log10() } else { ms };
             let last = i + 1 == n;
@@ -428,11 +486,12 @@ impl ViewerApp {
                 }
                 pui.set_auto_bounds([false, false]);
                 pui.set_plot_bounds_y(y_min..=y_max);
-                for (t, buckets) in &series {
+                for s in &series {
                     // each target in its own colour, loss marked along the bottom;
-                    // or SmokePing's own look: grey smoke, median coloured by loss
-                    let (smoke, median) = if loss_colours { (grey, None) } else { (t.color, Some(t.color)) };
-                    draw_target(pui, buckets, bucket_s, smoke, median, yv, &t.row.name);
+                    // or SmokePing's own look: grey smoke, median coloured by loss.
+                    // HTTP: same colour, lighter smoke, dashed median.
+                    let (smoke, median) = if loss_colours { (grey, None) } else { (s.t.color, Some(s.t.color)) };
+                    draw_target(pui, s.buckets, bucket_s, smoke, median, yv, &s.label(), s.http);
                 }
                 if !loss_colours {
                     draw_loss_marks(pui, &series, bucket_s, y_min, y_max);
@@ -462,34 +521,58 @@ impl ViewerApp {
     }
 }
 
-/// Target name with median and loss over the visible range.
-fn header(ui: &mut egui::Ui, t: &TargetView, visible: &[&Bucket]) {
-    let mut medians: Vec<f64> = visible.iter().filter_map(|b| b.pcts.map(|p| p[MEDIAN])).collect();
-    medians.sort_by(f64::total_cmp);
-    let (count, lost) = visible.iter().fold((0u64, 0u64), |(c, l), b| (c + b.count as u64, l + b.lost as u64));
-    ui.label(RichText::new(&t.row.name).strong().color(t.color)).on_hover_text(&t.row.host);
-    if !medians.is_empty() {
-        ui.label(format!("median {}", fmt_ms(percentile(&medians, 0.5))));
-    }
-    if count > 0 {
-        let pct = 100.0 * lost as f64 / count as f64;
-        ui.label(RichText::new(format!("loss {pct:.2}%")).color(loss_color(pct / 100.0)));
+/// Destination name, then median and loss of each of its series over the
+/// visible range.
+fn header(ui: &mut egui::Ui, t: &TargetView, series: &[&Series], in_view: &dyn Fn(&&Bucket) -> bool) {
+    let hover = match &t.http {
+        Some(h) => format!("ping {}\nHTTP {}", t.row.host, h.host),
+        None => t.row.host.clone(),
+    };
+    ui.label(RichText::new(&t.row.name).strong().color(t.color)).on_hover_text(hover);
+    for s in series {
+        let visible: Vec<&Bucket> = s.buckets.iter().filter(|b| in_view(b)).collect();
+        let mut medians: Vec<f64> = visible.iter().filter_map(|b| b.pcts.map(|p| p[MEDIAN])).collect();
+        medians.sort_by(f64::total_cmp);
+        let (count, lost) = visible.iter().fold((0u64, 0u64), |(c, l), b| (c + b.count as u64, l + b.lost as u64));
+        let kind = if s.http { "HTTP" } else { "ping" };
+        if !medians.is_empty() {
+            ui.label(format!("{kind} {}", fmt_ms(percentile(&medians, 0.5))));
+        } else if count > 0 {
+            ui.label(format!("{kind} –"));
+        }
+        if count > 0 && lost > 0 {
+            let pct = 100.0 * lost as f64 / count as f64;
+            let what = if s.http { "failed" } else { "loss" };
+            ui.label(RichText::new(format!("{what} {pct:.1}%")).color(loss_color(pct / 100.0)));
+        }
     }
 }
 
-/// Vertical range: a round value above typical medians, so that rare spikes
-/// do not flatten the graph (they are clipped, as in SmokePing).
-fn y_range(visible: &[&Bucket], log_y: bool) -> (f64, f64) {
-    let mut p75: Vec<f64> = visible.iter().filter_map(|b| b.pcts.map(|p| p[MEDIAN])).collect();
-    p75.sort_by(f64::total_cmp);
-    let typical = if p75.is_empty() { 50.0 } else { percentile(&p75, 0.9) * 1.8 };
+/// Vertical range: a round value above every series' typical median, so
+/// that rare spikes do not flatten the graph (they are clipped, as in
+/// SmokePing) while a slower series (HTTP) still fits.
+fn y_range(series: &[Vec<&Bucket>], log_y: bool) -> (f64, f64) {
+    let mut typical: f64 = 0.0;
+    let mut lowest = f64::INFINITY;
+    for visible in series {
+        let mut medians: Vec<f64> = visible.iter().filter_map(|b| b.pcts.map(|p| p[MEDIAN])).collect();
+        if medians.is_empty() {
+            continue;
+        }
+        medians.sort_by(f64::total_cmp);
+        typical = typical.max(percentile(&medians, 0.9) * 1.6);
+        lowest = lowest.min(medians[0]);
+    }
+    if typical == 0.0 {
+        typical = 50.0;
+    }
     let top = [1.0, 2.0, 5.0]
         .iter()
         .flat_map(|m| (0..5).map(move |e| m * 10f64.powi(e)))
         .filter(|&v| v >= typical.max(5.0))
         .fold(f64::INFINITY, f64::min);
     if log_y {
-        let low = p75.first().map(|v| v * 0.5).unwrap_or(1.0).max(0.1);
+        let low = if lowest.is_finite() { lowest * 0.5 } else { 1.0 }.max(0.1);
         (low.log10(), (top * 4.0).log10())
     } else {
         (0.0, top)
@@ -506,6 +589,7 @@ fn loss_color(loss: f64) -> Color32 {
 
 /// SmokePing drawing for one target: grey bands for the spread, a median
 /// step line coloured by loss, red shading where every ping was lost.
+#[allow(clippy::too_many_arguments)]
 fn draw_target(
     pui: &mut egui_plot::PlotUi<'_>,
     buckets: &[Bucket],
@@ -514,7 +598,10 @@ fn draw_target(
     median: Option<Color32>,
     yv: impl Fn(f64) -> f64,
     name: &str,
+    http: bool,
 ) {
+    // HTTP: lighter smoke, so that pings stay readable underneath
+    let smoke_alpha = if http { 0.025 } else { 0.045 };
     let edge = bucket_s * 0.001;
     let mut lost_from: Option<f64> = None;
     let mut segment: Vec<&Bucket> = Vec::new();
@@ -547,7 +634,7 @@ fn draw_target(
             let hi = MAX - lo;
             pui.add(
                 FilledArea::new(name, &xs, &col(lo), &col(hi))
-                    .fill_color(smoke.gamma_multiply(0.045))
+                    .fill_color(smoke.gamma_multiply(smoke_alpha))
                     .stroke(egui::Stroke::NONE)
                     .allow_hover(false),
             );
@@ -564,7 +651,11 @@ fn draw_target(
             let i = starts.partition_point(|s| s.0 <= p.x).saturating_sub(1);
             starts.get(i).map(|s| s.1).unwrap_or(Color32::GRAY)
         });
-        pui.line(Line::new(name, PlotPoints::from(pts)).gradient_color(gradient, false).width(2.0));
+        let mut line = Line::new(name, PlotPoints::from(pts)).gradient_color(gradient, false).width(2.0);
+        if http {
+            line = line.style(egui_plot::LineStyle::dashed_dense());
+        }
+        pui.line(line);
     };
 
     let mut prev_end = f64::NEG_INFINITY;
@@ -611,13 +702,16 @@ fn describe_place(fixes: &[Fix], segments: &[Segment], x: f64, max_gap_ms: i64) 
     ))
 }
 
-fn describe_buckets(series: &[(&TargetView, &Vec<Bucket>)], x: f64, bucket_s: f64) -> String {
-    if let [(_, buckets)] = series {
-        return describe_bucket(buckets, x, bucket_s);
-    }
+fn describe_buckets(series: &[Series], x: f64, bucket_s: f64) -> String {
     let ms = (x * 1000.0) as i64;
-    let mut lines = vec![fmt_time(x, bucket_s)];
-    for (t, buckets) in series {
+    let mut lines = vec![];
+    if let [s] = series {
+        lines.push(describe_bucket(s.buckets, x, bucket_s));
+    } else {
+        lines.push(fmt_time(x, bucket_s));
+    }
+    for s in series {
+        let buckets = s.buckets;
         let i = buckets.partition_point(|b| b.ts_ms <= ms).saturating_sub(1);
         let text = match buckets.get(i).filter(|b| ms < b.ts_ms + (bucket_s * 1000.0) as i64) {
             None => "no data".to_string(),
@@ -626,7 +720,22 @@ fn describe_buckets(series: &[(&TargetView, &Vec<Bucket>)], x: f64, bucket_s: f6
                 Some(p) => format!("{} (10–90%: {} – {}), loss {:.1}%", fmt_ms(p[MEDIAN]), fmt_ms(p[P10]), fmt_ms(p[P90]), b.loss_pct()),
             },
         };
-        lines.push(format!("{}: {text}", t.row.name));
+        if series.len() > 1 {
+            lines.push(format!("{}: {text}", s.label()));
+        }
+        // where the HTTP time went
+        if let Some(phases) = s.phases {
+            let i = phases.partition_point(|p| p.0 <= ms).saturating_sub(1);
+            if let Some((_, p)) = phases.get(i).filter(|p| ms < p.0 + (bucket_s * 1000.0) as i64) {
+                lines.push(format!(
+                    "   DNS {} · connect {} · TLS {} · answer {}",
+                    fmt_ms(p[0]),
+                    fmt_ms(p[1]),
+                    fmt_ms(p[2]),
+                    fmt_ms(p[3])
+                ));
+            }
+        }
     }
     lines.join("\n")
 }
@@ -634,14 +743,14 @@ fn describe_buckets(series: &[(&TargetView, &Vec<Bucket>)], x: f64, bucket_s: f6
 /// Combined chart: packet loss as marks along the bottom, coloured as in SmokePing.
 fn draw_loss_marks(
     pui: &mut egui_plot::PlotUi<'_>,
-    series: &[(&TargetView, &Vec<Bucket>)],
+    series: &[Series],
     bucket_s: f64,
     y_min: f64,
     y_max: f64,
 ) {
     let mut worst: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
-    for (_, buckets) in series {
-        for b in buckets.iter().filter(|b| b.lost > 0) {
+    for s in series {
+        for b in s.buckets.iter().filter(|b| b.lost > 0) {
             let e = worst.entry(b.ts_ms).or_insert(0.0);
             *e = e.max(b.lost as f64 / b.count.max(1) as f64);
         }
@@ -836,6 +945,8 @@ impl ViewerApp {
             log_y: self.log_y,
             split: self.split,
             loss_colours: self.loss_colours,
+            show_ping: self.show_ping,
+            show_http: self.show_http,
             // without positions there is no map to show: keep the saved choice
             map: if self.has_fixes { self.map.is_some() } else { self.saved_prefs.map },
             color_by: self.map.as_ref().map_or(self.saved_prefs.color_by, |m| m.color_by()),

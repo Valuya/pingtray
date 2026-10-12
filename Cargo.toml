@@ -14,13 +14,16 @@ ksni = "0.3.6"
 png = "0.18.1"
 quick-xml = "0.42.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 surge-ping = "0.9.1"
 tiny_http = "0.12.0"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = "3.4.2"
 walkers = "0.61.0"
+webpki-roots = { version = "1", default-features = false }

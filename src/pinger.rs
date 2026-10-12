@@ -17,6 +17,58 @@ pub struct Sample {
     pub target: usize,
     pub ts_ms: i64,
     pub rtt: Option<Duration>,
+    /// Set for HTTP probes (then `rtt` is the total time).
+    pub http: Option<crate::http_probe::Phases>,
+    pub kind: Kind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Icmp,
+    Http,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Icmp => "icmp",
+            Kind::Http => "http",
+        }
+    }
+}
+
+/// Starts one HTTP probe task per destination that has a URL.
+pub fn spawn_http(cfg: Arc<Config>, tx: mpsc::Sender<Sample>) {
+    for (idx, target) in cfg.targets.iter().enumerate() {
+        let Some(raw) = target.http.clone() else { continue };
+        let url = match crate::http_probe::Url::parse(&raw) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!("{}: {e}", target.name);
+                continue;
+            }
+        };
+        let (cfg, tx) = (cfg.clone(), tx.clone());
+        tokio::spawn(async move {
+            let period = Duration::from_secs_f64(cfg.http_interval_secs);
+            let timeout = Duration::from_millis(cfg.http_timeout_ms).min(period.mul_f64(0.9));
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let ts_ms = now_ms();
+                let result = crate::http_probe::probe(&url, timeout).await;
+                if let Err(e) = &result {
+                    tracing::debug!("{raw}: {e}");
+                }
+                let http = result.ok();
+                let sample = Sample { target: idx, ts_ms, rtt: http.map(|p| p.total()), http, kind: Kind::Http };
+                if tx.send(sample).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
 }
 
 const RESOLVE_EVERY: Duration = Duration::from_secs(300);
@@ -104,7 +156,7 @@ async fn target_loop(
             None => None,
         };
         seq = seq.wrapping_add(1);
-        if tx.send(Sample { target: idx, ts_ms, rtt }).await.is_err() {
+        if tx.send(Sample { target: idx, ts_ms, rtt, http: None, kind: Kind::Icmp }).await.is_err() {
             return;
         }
     }

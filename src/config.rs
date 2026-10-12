@@ -26,7 +26,7 @@ icon_height = 20
 
 # Positions from your phone (see README). Uncomment to enable.
 # [location]
-# listen = "0.0.0.0:8765"
+# listen = "0.0.0.0:18765"
 # token = "pick-a-long-random-string"
 # watch_dir = "~/Sync/gpslogger"
 # max_gap_secs = 600
@@ -45,6 +45,9 @@ host = "1.1.1.1"
 pub struct Config {
     pub interval_secs: f64,
     pub timeout_ms: u64,
+    /// Seconds between two HTTP probes of the same destination.
+    pub http_interval_secs: f64,
+    pub http_timeout_ms: u64,
     pub retention_days: u32,
     pub warn_ms: f64,
     pub bad_ms: f64,
@@ -65,6 +68,9 @@ pub struct Target {
     pub name: String,
     /// IP address or host name (resolved every few minutes).
     pub host: String,
+    /// Optional URL for HTTP probes, e.g. "https://www.google.com/generate_204".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
 }
 
 impl Default for Config {
@@ -72,6 +78,8 @@ impl Default for Config {
         Config {
             interval_secs: 2.0,
             timeout_ms: 1500,
+            http_interval_secs: 10.0,
+            http_timeout_ms: 5000,
             retention_days: 180,
             warn_ms: 60.0,
             bad_ms: 200.0,
@@ -99,6 +107,12 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.interval_secs = cfg.interval_secs.max(0.2);
+        cfg.http_interval_secs = cfg.http_interval_secs.max(1.0);
+        for t in &mut cfg.targets {
+            if t.http.as_deref().is_some_and(|u| u.trim().is_empty()) {
+                t.http = None;
+            }
+        }
         cfg.icon_columns = cfg.icon_columns.clamp(4, 120);
         cfg.icon_column_secs = cfg.icon_column_secs.max(cfg.interval_secs);
         cfg.icon_height = cfg.icon_height.clamp(9, 128);
@@ -143,7 +157,7 @@ pub fn runtime_dir() -> PathBuf {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LocationConfig {
-    /// Address for the phone to post positions to, e.g. "0.0.0.0:8765".
+    /// Address for the phone to post positions to, e.g. "0.0.0.0:18765".
     pub listen: Option<String>,
     /// Shared secret: `?token=…` or HTTP Basic password. Required unless loopback.
     pub token: Option<String>,

@@ -9,7 +9,7 @@ use eframe::egui::{self, RichText};
 
 use crate::config::{Config, LocationConfig, Target};
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:8765";
+const DEFAULT_LISTEN: &str = "0.0.0.0:18765";
 
 pub struct SettingsApp {
     path: PathBuf,
@@ -61,6 +61,11 @@ impl SettingsApp {
             if t.name.trim().is_empty() || t.host.trim().is_empty() {
                 return Err(format!("Destination {} needs a name and a host.", i + 1));
             }
+            if let Some(u) = &t.http
+                && let Err(e) = crate::http_probe::Url::parse(u)
+            {
+                return Err(format!("{}: {e}", t.name));
+            }
             if self.cfg.targets[..i].iter().any(|o| o.name.trim() == t.name.trim()) {
                 return Err(format!("Two destinations are called \"{}\".", t.name.trim()));
             }
@@ -101,12 +106,21 @@ impl SettingsApp {
         let n = self.cfg.targets.len();
         ui.horizontal(|ui| {
             ui.add_sized([180.0, 18.0], egui::Label::new(RichText::new("Name").strong()));
-            ui.add_sized([220.0, 18.0], egui::Label::new(RichText::new("Host or IP address").strong()));
+            ui.add_sized([150.0, 18.0], egui::Label::new(RichText::new("Ping host / IP").strong()));
+            ui.add_sized([260.0, 18.0], egui::Label::new(RichText::new("HTTP probe URL (optional)").strong()));
         });
         for (i, t) in self.cfg.targets.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.add_sized([180.0, 22.0], egui::TextEdit::singleline(&mut t.name).hint_text("Name"));
-                ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut t.host).hint_text("8.8.8.8"));
+                ui.add_sized([150.0, 22.0], egui::TextEdit::singleline(&mut t.host).hint_text("8.8.8.8"));
+                let url = t.http.get_or_insert_with(String::new);
+                ui.add_sized(
+                    [260.0, 22.0],
+                    egui::TextEdit::singleline(url).hint_text("https://www.google.com/generate_204"),
+                );
+                if url.trim().is_empty() {
+                    t.http = None;
+                }
                 if ui.add_enabled(i > 0, egui::Button::new("⏶")).on_hover_text("Move up").clicked() {
                     swap = Some((i - 1, i));
                 }
@@ -125,9 +139,10 @@ impl SettingsApp {
             self.cfg.targets.remove(i);
         }
         if ui.button("+ Add destination").clicked() {
-            self.cfg.targets.push(Target { name: String::new(), host: String::new() });
+            self.cfg.targets.push(Target { name: String::new(), host: String::new(), http: None });
         }
         ui.weak("History is kept per name: renaming a destination starts a new history.");
+        ui.weak("HTTP probes send a tiny HEAD request on a fresh connection, timing DNS, connect, TLS and the answer.");
     }
 
     fn pinging(&mut self, ui: &mut egui::Ui) {
@@ -137,6 +152,12 @@ impl SettingsApp {
             ui.end_row();
             ui.label("Count as lost after");
             ui.add(egui::DragValue::new(&mut self.cfg.timeout_ms).range(100..=10_000).speed(10).suffix(" ms"));
+            ui.end_row();
+            ui.label("HTTP probe every");
+            ui.add(egui::DragValue::new(&mut self.cfg.http_interval_secs).range(1.0..=600.0).speed(0.5).suffix(" s"));
+            ui.end_row();
+            ui.label("HTTP failed after");
+            ui.add(egui::DragValue::new(&mut self.cfg.http_timeout_ms).range(500..=30_000).speed(50).suffix(" ms"));
             ui.end_row();
             ui.label("Keep history for");
             ui.add(egui::DragValue::new(&mut self.cfg.retention_days).range(1..=3650).suffix(" days"));
@@ -206,7 +227,7 @@ impl SettingsApp {
                 });
                 ui.end_row();
             });
-            let port = listen.rsplit(':').next().unwrap_or("8765").to_string();
+            let port = listen.rsplit(':').next().unwrap_or("18765").to_string();
             let host = self.lan_ip.map_or("<this computer>".to_string(), |ip| ip.to_string());
             let token = loc.token.clone().unwrap_or_default();
             ui.add_space(4.0);
@@ -311,7 +332,7 @@ mod tests {
     #[test]
     fn config_roundtrips_through_toml() {
         let mut cfg = Config::default();
-        cfg.targets = vec![Target { name: "UCLouvain".into(), host: "130.104.1.1".into() }];
+        cfg.targets = vec![Target { name: "UCLouvain".into(), host: "130.104.1.1".into(), http: Some("https://uclouvain.be/".into()) }];
         cfg.tray_target = Some("UCLouvain".into());
         cfg.location.listen = Some(DEFAULT_LISTEN.into());
         cfg.location.token = Some(new_token());

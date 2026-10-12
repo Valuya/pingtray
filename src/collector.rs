@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{self, Config};
 use crate::icon::{self, Column, Current, IconData, PngSink, Thresholds};
-use crate::pinger::{self, Sample};
+use crate::pinger::{self, Kind, Sample};
 use crate::store::Store;
 use crate::tray::{TrayHandle, TrayState};
 
@@ -18,6 +18,8 @@ use crate::tray::{TrayHandle, TrayState};
 struct Live {
     names: Vec<String>,
     recent: Vec<VecDeque<(i64, Option<f64>)>>,
+    /// Last HTTP probe per target: total ms, or `None` when it failed.
+    last_http: Vec<Option<Option<f64>>>,
     keep_ms: i64,
     columns: usize,
     column_ms: i64,
@@ -33,11 +35,16 @@ impl Live {
         Live {
             names: cfg.targets.iter().map(|t| t.name.clone()).collect(),
             recent: vec![VecDeque::new(); cfg.targets.len()],
+            last_http: vec![None; cfg.targets.len()],
             keep_ms: TOOLTIP_WINDOW_MS.max(column_ms * cfg.icon_columns as i64),
             columns: cfg.icon_columns,
             column_ms,
             current_ms: ((cfg.interval_secs * 2.5).max(5.0) * 1000.0) as i64,
         }
+    }
+
+    fn push_http(&mut self, s: &Sample) {
+        self.last_http[s.target] = Some(s.rtt.map(|d| d.as_secs_f64() * 1000.0));
     }
 
     fn push(&mut self, s: &Sample) {
@@ -92,7 +99,12 @@ impl Live {
                 let lost = q.iter().filter(|(_, v)| v.is_none()).count();
                 let loss = if q.is_empty() { 0.0 } else { 100.0 * lost as f64 / q.len() as f64 };
                 let mark = if which.is_none_or(|w| w == i) { "● " } else { "○ " };
-                format!("{mark}{name}: {last}, loss {loss:.1} % (5 min)")
+                let http = match self.last_http[i] {
+                    None => String::new(),
+                    Some(None) => ", HTTP failed".to_string(),
+                    Some(Some(ms)) => format!(", HTTP {ms:.0} ms"),
+                };
+                format!("{mark}{name}: ping {last}{http}, loss {loss:.1} % (5 min)")
             })
             .collect()
     }
@@ -232,13 +244,19 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
     let ids = cfg
         .targets
         .iter()
-        .map(|t| store.upsert_target(&t.name, &t.host))
+        .map(|t| store.upsert_target(&t.name, &t.host, Kind::Icmp.as_str()))
+        .collect::<Result<Vec<_>>>()?;
+    let http_ids = cfg
+        .targets
+        .iter()
+        .map(|t| t.http.as_ref().map(|u| store.upsert_target(&t.name, u, Kind::Http.as_str())).transpose())
         .collect::<Result<Vec<_>>>()?;
 
     start_location_inputs(&cfg);
     watch_config(config_path.clone());
 
     let (tx, mut rx) = mpsc::channel::<Sample>(256);
+    pinger::spawn_http(cfg.clone(), tx.clone());
     pinger::spawn_all(cfg.clone(), tx)?;
 
     let mut live = Live::new(&cfg);
@@ -271,19 +289,37 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
 
     let retention_ms = cfg.retention_days as i64 * 86_400_000;
     let mut pending = Vec::new();
+    let mut pending_http = Vec::new();
     let mut last_flush = Instant::now();
     let mut last_purge: Option<Instant> = None;
 
     while let Some(s) = rx.recv().await {
-        live.push(&s);
-        let rtt_us = s.rtt.map(|d| d.as_micros().min(u32::MAX as u128) as u32);
-        pending.push((ids[s.target], s.ts_ms, rtt_us));
+        let us = |d: Duration| d.as_micros().min(u32::MAX as u128) as u32;
+        let rtt_us = s.rtt.map(us);
+        match s.kind {
+            Kind::Icmp => {
+                live.push(&s);
+                pending.push((ids[s.target], s.ts_ms, rtt_us));
+            }
+            Kind::Http => {
+                live.push_http(&s);
+                let Some(id) = http_ids[s.target] else { continue };
+                pending.push((id, s.ts_ms, rtt_us));
+                if let Some(p) = s.http {
+                    pending_http.push((id, s.ts_ms, [us(p.dns), us(p.connect), us(p.tls), us(p.wait)], p.status));
+                }
+            }
+        }
 
         if last_flush.elapsed() >= cfg.interval().mul_f64(0.9) {
             last_flush = Instant::now();
             let batch = std::mem::take(&mut pending);
-            tokio::task::block_in_place(|| store.insert_samples(&batch))
-                .unwrap_or_else(|e| tracing::error!("storing samples: {e}"));
+            let details = std::mem::take(&mut pending_http);
+            tokio::task::block_in_place(|| {
+                store.insert_samples(&batch)?;
+                store.insert_http_details(&details)
+            })
+            .unwrap_or_else(|e| tracing::error!("storing samples: {e}"));
             if last_purge.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
                 last_purge = Some(Instant::now());
                 let cutoff = pinger::now_ms() - retention_ms;
@@ -312,13 +348,13 @@ mod tests {
         cfg.icon_columns = 2;
         cfg.icon_column_secs = 10.0;
         cfg.targets = vec![
-            Target { name: "a".into(), host: "a".into() },
-            Target { name: "b".into(), host: "b".into() },
+            Target { name: "a".into(), host: "a".into(), http: None },
+            Target { name: "b".into(), host: "b".into(), http: None },
         ];
         let mut live = Live::new(&cfg);
         let ms = |v: u64| Some(Duration::from_millis(v));
         for (target, ts_ms, rtt) in [(0, 1_000, ms(10)), (1, 1_000, None), (0, 12_000, ms(20)), (1, 12_000, ms(40))] {
-            live.push(&Sample { target, ts_ms, rtt });
+            live.push(&Sample { target, ts_ms, rtt, http: None, kind: Kind::Icmp });
         }
         let d = live.icon_data(13_000, None);
         assert_eq!(d.columns[0].loss, 0.5);

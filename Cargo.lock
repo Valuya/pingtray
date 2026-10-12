@@ -3312,16 +3312,19 @@ dependencies = [
  "png 0.18.1",
  "quick-xml 0.42.0",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "surge-ping",
  "tiny_http",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
  "ureq",
  "walkers",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -54,6 +54,8 @@ pub struct Segment {
     pub to_ms: i64,
     pub mode: Mode,
     pub km: f64,
+    /// Halts on the way (stations, traffic): at least `STOP_MIN_MS` below walking pace.
+    pub stops: u32,
 }
 
 impl Segment {
@@ -70,6 +72,8 @@ type RailSeg = ((f64, f64), (f64, f64), Mode);
 pub struct Rails {
     segs: Vec<RailSeg>,
     grid: HashMap<(i32, i32), Vec<usize>>,
+    /// Tiles whose railways are known; `None` means everywhere.
+    covered: Option<HashSet<(u32, u32)>>,
 }
 
 const CELL_DEG: f64 = 0.003; // about 330 m north-south
@@ -94,7 +98,11 @@ impl Rails {
                 }
             }
         }
-        Rails { segs, grid }
+        Rails { segs, grid, covered: None }
+    }
+
+    fn knows(&self, lat: f64, lon: f64) -> bool {
+        self.covered.as_ref().is_none_or(|c| c.contains(&tile_of(lat, lon)))
     }
 
     /// Nearest railway within about one grid cell: distance in metres and kind.
@@ -141,6 +149,15 @@ fn percentile(mut v: Vec<f64>, p: f64) -> f64 {
 const SMOOTH_MS: i64 = 90_000;
 const SPEED_BASE_MS: i64 = 60_000;
 const MIN_RUN_MS: i64 = 120_000;
+/// A halt this short between two stretches of the same vehicle is a stop on
+/// the way (a station), not the end of the journey.
+const STOP_MAX_MS: i64 = 6 * 60_000;
+const STOP_MIN_MS: i64 = 20_000;
+const STOP_SPEED: f64 = 1.0;
+
+fn motorised(m: Mode) -> bool {
+    matches!(m, Mode::Vehicle | Mode::Car | Mode::Train | Mode::Tram | Mode::Metro)
+}
 
 /// Splits the track into segments of one transport mode. `rails` is asked
 /// for railway data around each motorised stretch.
@@ -264,9 +281,22 @@ pub fn classify(
                 };
             }
             let km = track.windows(2).map(|w| distance_m(w[0].lat, w[0].lon, w[1].lat, w[1].lon)).sum::<f64>() / 1000.0;
-            Segment { from_ms: track[0].ts_ms, to_ms: track[track.len() - 1].ts_ms, mode, km }
+            Segment { from_ms: track[0].ts_ms, to_ms: track[track.len() - 1].ts_ms, mode, km, stops: 0 }
         })
         .collect();
+    // station stops: train, halt, same train
+    for i in 1..segments.len().saturating_sub(1) {
+        let (prev, cur, next) = (&segments[i - 1], &segments[i], &segments[i + 1]);
+        if matches!(cur.mode, Mode::Still | Mode::Foot)
+            && cur.to_ms - cur.from_ms <= STOP_MAX_MS
+            && motorised(prev.mode)
+            && prev.mode == next.mode
+            && cur.from_ms - prev.to_ms <= max_gap_ms
+            && next.from_ms - cur.to_ms <= max_gap_ms
+        {
+            segments[i].mode = prev.mode;
+        }
+    }
     segments.dedup_by(|b, a| {
         let same = a.mode == b.mode && b.from_ms - a.to_ms <= max_gap_ms;
         if same {
@@ -275,13 +305,44 @@ pub fn classify(
         }
         same
     });
+    for s in segments.iter_mut().filter(|s| motorised(s.mode)) {
+        s.stops = count_stops(&fixes, &speeds, s.from_ms, s.to_ms);
+    }
     segments
+}
+
+/// Halts inside `[from_ms, to_ms]`: stretches below walking pace lasting at
+/// least `STOP_MIN_MS`, not counting the very start and end.
+fn count_stops(fixes: &[Fix], speeds: &[Option<f64>], from_ms: i64, to_ms: i64) -> u32 {
+    let (lo, hi) = (fixes.partition_point(|f| f.ts_ms < from_ms), fixes.partition_point(|f| f.ts_ms <= to_ms));
+    let mut stops = 0;
+    let mut slow_since: Option<i64> = None;
+    for i in lo..hi {
+        let slow = speeds[i].is_some_and(|v| v < STOP_SPEED);
+        match (slow, slow_since) {
+            (true, None) => slow_since = Some(fixes[i].ts_ms),
+            (false, Some(t)) => {
+                if fixes[i].ts_ms - t >= STOP_MIN_MS && t > from_ms {
+                    stops += 1;
+                }
+                slow_since = None;
+            }
+            _ => {}
+        }
+    }
+    stops
 }
 
 fn rail_mode(rails: &Rails, track: &[Fix]) -> Mode {
     let mut on_rail = 0;
     let mut kinds: HashMap<Mode, usize> = HashMap::new();
-    for f in track {
+    // judge only where the railways are known
+    let known: Vec<&Fix> = track.iter().filter(|f| rails.knows(f.lat, f.lon)).collect();
+    if known.len() * 3 < track.len() {
+        return Mode::Vehicle;
+    }
+    let track = known;
+    for f in &track {
         let tolerance = f.acc_m.unwrap_or(30.0).clamp(30.0, 100.0);
         if let Some((d, kind)) = rails.nearest(f.lat, f.lon)
             && d <= tolerance {
@@ -389,28 +450,41 @@ pub fn rails_for(store: &Store, track: &[Fix]) -> Option<Rails> {
     let tiles: HashSet<(u32, u32)> = track.iter().map(|f| tile_of(f.lat, f.lon)).collect();
     let now = crate::pinger::now_ms();
     let mut ways = Vec::new();
+    let mut covered = HashSet::new();
     for (x, y) in tiles {
         let cached = store.rail_tile(RAIL_ZOOM, x, y).ok().flatten();
         let json = match cached {
-            Some((fetched, json)) if now - fetched < RAIL_MAX_AGE_MS => json,
-            _ => match fetch_tile(x, y) {
-                Ok(json) => {
-                    let _ = store.set_rail_tile(RAIL_ZOOM, x, y, now, &json);
-                    std::thread::sleep(std::time::Duration::from_millis(500)); // be gentle with Overpass
-                    json
-                }
-                Err(e) => {
-                    tracing::warn!("railways for tile {x}/{y}: {e}");
-                    match cached {
-                        Some((_, stale)) => stale,
-                        None => return None,
+            Some((fetched, json)) if now - fetched < RAIL_MAX_AGE_MS => Some(json),
+            _ => {
+                // public servers throttle: one retry after a pause
+                let fetched = fetch_tile(x, y).or_else(|_| {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    fetch_tile(x, y)
+                });
+                match fetched {
+                    Ok(json) => {
+                        let _ = store.set_rail_tile(RAIL_ZOOM, x, y, now, &json);
+                        std::thread::sleep(std::time::Duration::from_secs(1)); // be gentle with Overpass
+                        Some(json)
+                    }
+                    Err(e) => {
+                        tracing::warn!("railways for tile {x}/{y}: {e:#}");
+                        cached.map(|(_, stale)| stale)
                     }
                 }
-            },
+            }
         };
-        ways.extend(parse_tile(&json));
+        if let Some(json) = json {
+            ways.extend(parse_tile(&json));
+            covered.insert((x, y));
+        }
     }
-    Some(Rails::new(&ways))
+    if covered.is_empty() {
+        return None;
+    }
+    let mut rails = Rails::new(&ways);
+    rails.covered = Some(covered);
+    Some(rails)
 }
 
 #[cfg(test)]
@@ -443,6 +517,21 @@ mod tests {
         }
         let segs = classify(&fixes, 600_000, |_| Some(Rails::new(&[])));
         assert_eq!(segs.iter().map(|s| s.mode).collect::<Vec<_>>(), vec![Mode::Foot]);
+    }
+
+    #[test]
+    fn station_stops_stay_in_the_train() {
+        // 8 min at 30 m/s, 3 min standing in a station, 8 min again, along a line
+        let a = track(0, 480, 5, 30.0, 4.0);
+        let stop_lon = a.last().unwrap().lon;
+        let stop = track(485_000, 180, 5, 0.0, stop_lon);
+        let b = track(670_000, 480, 5, 30.0, stop_lon);
+        let fixes: Vec<Fix> = a.into_iter().chain(stop).chain(b).collect();
+        let line = vec![(Mode::Train, vec![(50.5001, 3.9), (50.5001, 4.9)])];
+        let segs = classify(&fixes, 600_000, |_| Some(Rails::new(&line)));
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert_eq!(segs[0].mode, Mode::Train);
+        assert_eq!(segs[0].stops, 1);
     }
 
     #[test]
