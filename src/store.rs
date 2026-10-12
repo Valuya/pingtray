@@ -42,6 +42,7 @@ pub struct Bucket {
 }
 
 impl Bucket {
+    #[cfg(test)]
     pub fn loss_pct(&self) -> f64 {
         if self.count == 0 { 0.0 } else { 100.0 * self.lost as f64 / self.count as f64 }
     }

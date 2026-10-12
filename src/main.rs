@@ -7,6 +7,7 @@ mod location;
 mod map;
 mod pinger;
 mod settings;
+mod smoke;
 mod store;
 mod transport;
 mod tray;
