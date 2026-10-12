@@ -222,9 +222,9 @@ pub fn battery(percentage: f64, preserve: bool, threshold: u32, charging: bool, 
     } else {
         let _ = write!(
             s,
-            r#"<rect x="{}" y="{}" width="{:.2}" height="{:.2}" rx="{:.2}" fill="{WHITE}"/>"#,
-            format!("{:.2}", sx + 0.8 * u),
-            format!("{:.2}", sy + 0.3 * u),
+            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="{:.2}" fill="{WHITE}"/>"#,
+            sx + 0.8 * u,
+            sy + 0.3 * u,
             8.4 * u,
             1.5 * u,
             0.4 * u
