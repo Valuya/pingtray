@@ -1,4 +1,5 @@
 mod collector;
+mod colors;
 mod config;
 mod icon;
 mod location;
@@ -37,6 +38,12 @@ enum Command {
     /// Import positions from GPX, CSV, OwnTracks .rec or JSON files.
     Import {
         files: Vec<PathBuf>,
+    },
+    /// List journeys with their guessed transport mode.
+    Trips {
+        /// How far back, in hours.
+        #[arg(long, default_value_t = 24.0)]
+        hours: f64,
     },
     /// Start pingtray with the desktop session (XDG autostart).
     Autostart {
@@ -104,13 +111,47 @@ fn main() -> Result<()> {
                 .block_on(collector::run(cfg, config_path, with_tray))
         }
         Command::View => {
-            let Some(_lock) = single_instance("viewer.lock")? else {
+            // a snapshot (debug aid) may run next to an open window
+            let lock = if std::env::var_os("PINGTRAY_SNAPSHOT").is_some() {
+                Some(None)
+            } else {
+                single_instance("viewer.lock")?.map(Some)
+            };
+            let Some(_lock) = lock else {
                 tracing::info!("viewer already open");
                 return Ok(());
             };
             viewer::run(cfg)
         }
         Command::Autostart { remove } => autostart(remove, &config_path),
+        Command::Trips { hours } => {
+            let store = store::Store::open(&config::db_path())?;
+            let now = pinger::now_ms();
+            let fixes = store.fixes(now - (hours * 3_600_000.0) as i64, now + 1)?;
+            let gap = cfg.location.max_gap_ms();
+            let segments = transport::classify(&fixes, gap, |track| transport::rails_for(&store, track));
+            if segments.is_empty() {
+                println!("no positions in the last {hours} h");
+            }
+            let t = |ms: i64| {
+                chrono::TimeZone::timestamp_millis_opt(&chrono::Local, ms)
+                    .single()
+                    .map(|d| d.format("%a %d/%m %H:%M").to_string())
+                    .unwrap_or_default()
+            };
+            for s in segments {
+                println!(
+                    "{} - {}  {:<10} {:>6.1} km  {:>4.0} km/h  {:>4} min",
+                    t(s.from_ms),
+                    t(s.to_ms),
+                    s.mode.label(),
+                    s.km,
+                    s.kmh(),
+                    (s.to_ms - s.from_ms) / 60_000
+                );
+            }
+            Ok(())
+        }
         Command::Import { files } => {
             let mut store = store::Store::open(&config::db_path())?;
             location::import_files(&mut store, &files)

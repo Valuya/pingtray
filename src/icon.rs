@@ -51,18 +51,6 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
 }
 
-/// SmokePing-like colours for the lost fraction of a column.
-pub fn loss_rgb(loss: f64) -> [u8; 3] {
-    match loss {
-        l if l <= 0.0 => [0x33, 0xd1, 0x7a], // green
-        l if l < 0.05 => [0x33, 0xc7, 0xde], // cyan
-        l if l < 0.10 => [0x35, 0x84, 0xe4], // blue
-        l if l < 0.20 => [0xa3, 0x47, 0xba], // purple
-        l if l < 0.50 => [0xff, 0x78, 0x00], // orange
-        _ => [0xe0, 0x1b, 0x24],             // red
-    }
-}
-
 /// Upper bound of the graph: a round value above typical columns. Outliers
 /// are clipped at the top rather than squashing everything else.
 pub fn ceiling_ms(columns: &[Column]) -> f64 {
@@ -169,19 +157,17 @@ pub fn render(data: &IconData, height: usize, th: Thresholds) -> (usize, usize, 
     // current value
     let (label, rgb) = match data.current {
         Current::Unknown => ("?".to_string(), [0x9a, 0x99, 0x96]),
-        Current::Lost => ("--".to_string(), [0xe0, 0x1b, 0x24]),
+        Current::Lost => ("--".to_string(), crate::colors::BAD),
         Current::Ms(ms) => {
             let label = match ms {
                 m if m < 9.95 => format!("{m:.1}"),
                 m if m < 999.5 => format!("{m:.0}"),
                 m => format!("{:.0}k", (m / 1000.0).min(99.0)),
             };
-            let rgb = if ms >= th.bad_ms {
-                [0xff, 0x78, 0x00]
-            } else if ms >= th.warn_ms {
-                [0xf6, 0xd3, 0x2d]
-            } else {
-                [0xf6, 0xf5, 0xf4]
+            // plain white when fine, the quality ramp otherwise
+            let rgb = match crate::colors::latency_level(ms, th) {
+                0 => [0xf6, 0xf5, 0xf4],
+                _ => crate::colors::latency_rgb(ms, th),
             };
             (label, rgb)
         }
@@ -204,12 +190,12 @@ pub fn render(data: &IconData, height: usize, th: Thresholds) -> (usize, usize, 
             continue;
         }
         match col.pcts {
-            None => c.rect(x0, 0, x1, h, loss_rgb(1.0), 0xb0),
+            None => c.rect(x0, 0, x1, h, crate::colors::OUTAGE, 0xd0),
             Some([min, p25, med, p75, max]) => {
                 c.rect(x0, y_of(max), x1, y_of(min) + 1, white, 0x50);
                 c.rect(x0, y_of(p75), x1, y_of(p25) + 1, white, 0x70);
                 let y = y_of(med).min(h - 2);
-                c.rect(x0, y, x1, y + 2, loss_rgb(col.loss), 0xff);
+                c.rect(x0, y, x1, y + 2, crate::colors::loss_rgb(col.loss), 0xff);
             }
         }
     }

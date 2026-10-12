@@ -10,13 +10,14 @@ use chrono::{Local, Offset, TimeZone};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{FilledArea, GridInput, GridMark, HoverPosition, Line, Plot, PlotPoint, PlotPoints, Span};
 
+use crate::colors;
 use crate::config::Config;
 use crate::pinger::now_ms;
 use crate::icon::percentile;
 use crate::icon::Thresholds;
 use crate::location::Fix;
-use crate::map::{MapInput, MapView};
-use crate::store::{Bucket, MEDIAN, Store, TargetRow};
+use crate::map::{ColorBy, MapInput, MapView};
+use crate::store::{Bucket, MAX, MEDIAN, MIN, P10, P90, Store, TargetRow};
 use crate::transport::{self, Segment};
 
 const SPANS: &[(&str, f64)] = &[
@@ -38,16 +39,31 @@ const MAX_POINTS: f64 = 500.0;
 const MIN_PINGS_PER_POINT: f64 = 5.0;
 const MIN_SPAN: f64 = 30.0;
 const MAX_SPAN: f64 = 400.0 * 86_400.0;
-const PALETTE: [Color32; 8] = [
-    Color32::from_rgb(0x35, 0x84, 0xe4),
-    Color32::from_rgb(0xe6, 0x61, 0x00),
-    Color32::from_rgb(0x2e, 0xc2, 0x7e),
-    Color32::from_rgb(0x91, 0x41, 0xac),
-    Color32::from_rgb(0xe0, 0x1b, 0x24),
-    Color32::from_rgb(0xf5, 0xc2, 0x11),
-    Color32::from_rgb(0x00, 0xa5, 0xa5),
-    Color32::from_rgb(0x98, 0x6a, 0x44),
-];
+
+/// Window toggles, remembered between openings.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Prefs {
+    log_y: bool,
+    split: bool,
+    loss_colours: bool,
+    map: bool,
+    color_by: ColorBy,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Prefs { log_y: false, split: false, loss_colours: false, map: true, color_by: ColorBy::Quality }
+    }
+}
+
+fn prefs_path() -> PathBuf {
+    crate::config::data_dir().join("viewer.toml")
+}
+
+fn load_prefs() -> Prefs {
+    std::fs::read_to_string(prefs_path()).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
+}
 
 struct TargetView {
     row: TargetRow,
@@ -88,6 +104,8 @@ pub struct ViewerApp {
     log_y: bool,
     /// One chart per target instead of one for all.
     split: bool,
+    /// SmokePing look: grey smoke, median coloured by loss (one target per chart).
+    loss_colours: bool,
     loaded: Option<Answer>,
     segments: Vec<Segment>,
     has_fixes: bool,
@@ -100,6 +118,7 @@ pub struct ViewerApp {
     ans_rx: mpsc::Receiver<Msg>,
     /// Debug aid: save a screenshot of the window to this path, then quit.
     snapshot: Option<(PathBuf, u32)>,
+    saved_prefs: Prefs,
 }
 
 fn spawn_worker(db: PathBuf, max_gap_ms: i64, ctx: egui::Context) -> (mpsc::Sender<Query>, mpsc::Receiver<Msg>) {
@@ -186,10 +205,11 @@ impl ViewerApp {
             }
         }
         for (i, t) in targets.iter_mut().enumerate() {
-            t.color = PALETTE[i % PALETTE.len()];
+            t.color = rgb(colors::TARGETS[i % colors::TARGETS.len()]);
         }
         let first_sample_s = store.first_sample_ms()?.map(|ms| ms as f64 / 1000.0);
         let has_fixes = store.has_fixes()?;
+        let prefs = load_prefs();
         let max_gap_ms = cfg.location.max_gap_ms();
         let (req_tx, ans_rx) = spawn_worker(db, max_gap_ms, cc.egui_ctx.clone());
         let now = now_ms() as f64 / 1000.0;
@@ -201,12 +221,14 @@ impl ViewerApp {
             first_sample_s,
             view: (now - 3600.0, now),
             follow: true,
-            log_y: false,
-            split: false,
+            log_y: prefs.log_y,
+            split: prefs.split,
+            loss_colours: prefs.loss_colours,
             loaded: None,
             segments: Vec::new(),
             has_fixes,
-            map: None,
+            map: (prefs.map && has_fixes).then(|| MapView::new(&cc.egui_ctx, prefs.color_by)),
+            saved_prefs: prefs,
             hover_x: None,
             sent: None,
             sent_at: Instant::now(),
@@ -275,10 +297,12 @@ impl ViewerApp {
             ui.checkbox(&mut self.follow, "Live");
             ui.checkbox(&mut self.log_y, "Log scale");
             ui.checkbox(&mut self.split, "Split").on_hover_text("One chart per target");
+            ui.checkbox(&mut self.loss_colours, "Loss colours")
+                .on_hover_text("SmokePing look: grey smoke, median coloured by packet loss (charts with one target)");
             if self.has_fixes {
                 let mut on = self.map.is_some();
                 if ui.checkbox(&mut on, "Map").changed() {
-                    self.map = on.then(|| MapView::new(ui.ctx()));
+                    self.map = on.then(|| MapView::new(ui.ctx(), self.saved_prefs.color_by));
                 }
             }
             ui.separator();
@@ -365,13 +389,19 @@ impl ViewerApp {
             let to_ms = move |y: f64| if log_y { 10f64.powf(y) } else { y };
             let yv = move |ms: f64| if log_y { ms.max(0.1).log10() } else { ms };
             let last = i + 1 == n;
-            let single = series.len() == 1;
+            // with several targets on one chart, loss colours would be ambiguous
+            let loss_colours = self.loss_colours && series.len() == 1;
             let hover_text = |hp: &HoverPosition<'_>| -> Option<String> {
                 let x = match hp {
                     HoverPosition::NearDataPoint { position, .. } => position.x,
                     HoverPosition::Elsewhere { position } => position.x,
                 };
-                Some(describe_buckets(&series, x, bucket_s))
+                let mut text = describe_buckets(&series, x, bucket_s);
+                if let Some(place) = describe_place(&answer.fixes, &self.segments, x, self.max_gap_ms) {
+                    text.push('\n');
+                    text.push_str(&place);
+                }
+                Some(text)
             };
             let plot = Plot::new(("rtt", group.iter().map(|t| t.row.id).collect::<Vec<_>>()))
                 .height(per_plot)
@@ -394,12 +424,12 @@ impl ViewerApp {
                 pui.set_auto_bounds([false, false]);
                 pui.set_plot_bounds_y(y_min..=y_max);
                 for (t, buckets) in &series {
-                    // alone: grey smoke and a median coloured by loss, as in
-                    // SmokePing; together: each target in its own colour
-                    let (smoke, median) = if single { (grey, None) } else { (t.color, Some(t.color)) };
+                    // each target in its own colour, loss marked along the bottom;
+                    // or SmokePing's own look: grey smoke, median coloured by loss
+                    let (smoke, median) = if loss_colours { (grey, None) } else { (t.color, Some(t.color)) };
                     draw_target(pui, buckets, bucket_s, smoke, median, yv, &t.row.name);
                 }
-                if !single {
+                if !loss_colours {
                     draw_loss_marks(pui, &series, bucket_s, y_min, y_max);
                 }
                 (pui.plot_bounds(), pui.pointer_coordinate())
@@ -461,9 +491,12 @@ fn y_range(visible: &[&Bucket], log_y: bool) -> (f64, f64) {
     }
 }
 
+fn rgb(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
 fn loss_color(loss: f64) -> Color32 {
-    let [r, g, b] = crate::icon::loss_rgb(loss);
-    Color32::from_rgb(r, g, b)
+    rgb(colors::loss_rgb(loss))
 }
 
 /// SmokePing drawing for one target: grey bands for the spread, a median
@@ -503,10 +536,13 @@ fn draw_target(
                 [v, v]
             }).collect()
         };
-        for (lo, hi, alpha) in [(0, 6, 0.10), (1, 5, 0.14), (2, 4, 0.22)] {
+        // smoke: nested percentile bands, each adding a little opacity, so
+        // that it thickens smoothly towards the median
+        for lo in 0..MEDIAN {
+            let hi = MAX - lo;
             pui.add(
                 FilledArea::new(name, &xs, &col(lo), &col(hi))
-                    .fill_color(smoke.gamma_multiply(alpha))
+                    .fill_color(smoke.gamma_multiply(0.045))
                     .stroke(egui::Stroke::NONE)
                     .allow_hover(false),
             );
@@ -556,6 +592,20 @@ fn draw_target(
     }
 }
 
+/// Where you were at time `x` (unix s): coordinates, accuracy, transport mode.
+fn describe_place(fixes: &[Fix], segments: &[Segment], x: f64, max_gap_ms: i64) -> Option<String> {
+    let ms = (x * 1000.0) as i64;
+    let p = crate::location::estimate_at(fixes, ms, max_gap_ms)?;
+    let mode = segments.iter().find(|s| s.from_ms <= ms && ms <= s.to_ms).map(|s| s.mode.label());
+    Some(format!(
+        "at {:.5}, {:.5} (±{:.0} m){}",
+        p.lat,
+        p.lon,
+        p.uncertainty_m,
+        mode.map(|m| format!(", {m}")).unwrap_or_default()
+    ))
+}
+
 fn describe_buckets(series: &[(&TargetView, &Vec<Bucket>)], x: f64, bucket_s: f64) -> String {
     if let [(_, buckets)] = series {
         return describe_bucket(buckets, x, bucket_s);
@@ -568,7 +618,7 @@ fn describe_buckets(series: &[(&TargetView, &Vec<Bucket>)], x: f64, bucket_s: f6
             None => "no data".to_string(),
             Some(b) => match b.pcts {
                 None => "all lost".to_string(),
-                Some(p) => format!("{} (10–90%: {} – {}), loss {:.1}%", fmt_ms(p[MEDIAN]), fmt_ms(p[1]), fmt_ms(p[5]), b.loss_pct()),
+                Some(p) => format!("{} (10–90%: {} – {}), loss {:.1}%", fmt_ms(p[MEDIAN]), fmt_ms(p[P10]), fmt_ms(p[P90]), b.loss_pct()),
             },
         };
         lines.push(format!("{}: {text}", t.row.name));
@@ -612,10 +662,10 @@ fn describe_bucket(buckets: &[Bucket], x: f64, bucket_s: f64) -> String {
             Some(p) => format!(
                 "{t}\nmedian {}\n10–90%: {} – {}\nmin/max: {} – {}\nloss {:.1}% of {}",
                 fmt_ms(p[MEDIAN]),
-                fmt_ms(p[1]),
-                fmt_ms(p[5]),
-                fmt_ms(p[0]),
-                fmt_ms(p[6]),
+                fmt_ms(p[P10]),
+                fmt_ms(p[P90]),
+                fmt_ms(p[MIN]),
+                fmt_ms(p[MAX]),
                 b.loss_pct(),
                 b.count
             ),
@@ -635,6 +685,7 @@ fn fmt_ms(ms: f64) -> String {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.snapshot_step(ui);
+        self.save_prefs_if_changed();
         while let Ok(msg) = self.ans_rx.try_recv() {
             match msg {
                 Msg::Data(a) => {
@@ -667,9 +718,12 @@ impl eframe::App for ViewerApp {
                 ));
                 ui.separator();
                 let single = self.split || self.targets.iter().filter(|t| t.shown).count() == 1;
-                ui.weak(if single { "median colour = loss:" } else { "loss marks:" });
-                for (label, loss) in [("0", 0.0), ("<5%", 0.01), ("<10%", 0.07), ("<20%", 0.15), ("<50%", 0.3), ("more", 0.6)] {
-                    ui.label(RichText::new(format!("■ {label}")).color(loss_color(loss)));
+                ui.weak(if self.loss_colours && single { "median colour = loss:" } else { "loss marks:" });
+                if self.loss_colours && single {
+                    ui.label(RichText::new("■ none").color(rgb(colors::GOOD)));
+                }
+                for (label, c) in colors::LOSS_LEGEND {
+                    ui.label(RichText::new(format!("■ {label}")).color(rgb(c)));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak("wheel: zoom · drag: scroll · double-click: live");
@@ -772,12 +826,32 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
 }
 
 impl ViewerApp {
+    fn save_prefs_if_changed(&mut self) {
+        let prefs = Prefs {
+            log_y: self.log_y,
+            split: self.split,
+            loss_colours: self.loss_colours,
+            // without positions there is no map to show: keep the saved choice
+            map: if self.has_fixes { self.map.is_some() } else { self.saved_prefs.map },
+            color_by: self.map.as_ref().map_or(self.saved_prefs.color_by, |m| m.color_by()),
+        };
+        if prefs != self.saved_prefs {
+            self.saved_prefs = prefs;
+            if let Ok(text) = toml::to_string(&prefs) {
+                let _ = std::fs::write(prefs_path(), text);
+            }
+        }
+    }
+
     fn snapshot_step(&mut self, ui: &egui::Ui) {
         let loaded = self.loaded.is_some();
         let Some((path, frames)) = &mut self.snapshot else { return };
         let ctx = ui.ctx().clone();
         *frames += 1;
-        if *frames == 30 || (*frames > 30 && *frames % 50 == 0 && loaded) {
+        // PINGTRAY_SNAPSHOT_SECS: let tiles and data arrive first (default 3 s)
+        let wait: f64 = std::env::var("PINGTRAY_SNAPSHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        let ready = loaded && ui.input(|i| i.time) >= wait;
+        if ready && *frames % 20 == 0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         let shot = ui.input(|i| {
@@ -850,15 +924,7 @@ impl ViewerApp {
         if !any {
             return None;
         }
-        Some(if worst_loss > 0.0 {
-            loss_color(worst_loss)
-        } else {
-            match worst_median {
-                Some(m) if m >= self.thresholds.bad_ms => Color32::from_rgb(0xff, 0x78, 0x00),
-                Some(m) if m >= self.thresholds.warn_ms => Color32::from_rgb(0xf6, 0xd3, 0x2d),
-                _ => loss_color(0.0),
-            }
-        })
+        Some(rgb(colors::quality_rgb(worst_loss, worst_median, self.thresholds)))
     }
 
     fn map_panel(&mut self, ui: &mut egui::Ui) {

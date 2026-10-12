@@ -77,6 +77,26 @@ impl Live {
         IconData { current, columns }
     }
 
+    /// One line per target, for the top of the menu.
+    fn status_lines(&self, which: Option<usize>) -> Vec<String> {
+        self.names
+            .iter()
+            .zip(&self.recent)
+            .enumerate()
+            .map(|(i, (name, q))| {
+                let last = match q.back() {
+                    None => "…".to_string(),
+                    Some((_, None)) => "lost".to_string(),
+                    Some((_, Some(ms))) => format!("{ms:.0} ms"),
+                };
+                let lost = q.iter().filter(|(_, v)| v.is_none()).count();
+                let loss = if q.is_empty() { 0.0 } else { 100.0 * lost as f64 / q.len() as f64 };
+                let mark = if which.is_none_or(|w| w == i) { "● " } else { "○ " };
+                format!("{mark}{name}: {last}, loss {loss:.1} % (5 min)")
+            })
+            .collect()
+    }
+
     fn tooltip(&self, cfg: &Config, which: Option<usize>) -> String {
         let mut lines: Vec<String> = self
             .names
@@ -134,6 +154,7 @@ impl TrayFeed {
             icon_file,
             pixmap: (w, h, icon::rgba_to_argb(rgba)),
             tooltip: live.tooltip(cfg, which),
+            status: live.status_lines(which),
             ..self.base.clone()
         };
         self.handle.update(state).await;

@@ -431,17 +431,45 @@ fn handle(req: &mut tiny_http::Request, token: Option<&str>, store: &mut Store) 
     }
 }
 
-/// Position at `ts_ms`, interpolated between the surrounding fixes when they
-/// are less than `max_gap_ms` apart. `fixes` must be sorted by time.
-pub fn position_at(fixes: &[Fix], ts_ms: i64, max_gap_ms: i64) -> Option<(f64, f64)> {
+/// A position with its uncertainty radius (metres).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Estimate {
+    pub lat: f64,
+    pub lon: f64,
+    pub uncertainty_m: f64,
+}
+
+/// Accuracy assumed when the device did not report one.
+pub const DEFAULT_ACC_M: f64 = 30.0;
+/// Drift assumed away from a fix, when only one side is known.
+const DRIFT_MS: f64 = 1.5;
+
+/// Like [`position_at`], with an honest uncertainty: the fixes' own accuracy,
+/// plus the leeway of interpolating between them (the route may have bent),
+/// plus drift when only one side is known.
+pub fn estimate_at(fixes: &[Fix], ts_ms: i64, max_gap_ms: i64) -> Option<Estimate> {
     let i = fixes.partition_point(|f| f.ts_ms <= ts_ms);
+    let acc = |f: &Fix| f.acc_m.unwrap_or(DEFAULT_ACC_M);
     match (i.checked_sub(1).map(|j| &fixes[j]), fixes.get(i)) {
         (Some(a), Some(b)) if b.ts_ms - a.ts_ms <= max_gap_ms => {
             let r = (ts_ms - a.ts_ms) as f64 / (b.ts_ms - a.ts_ms).max(1) as f64;
-            Some((a.lat + (b.lat - a.lat) * r, a.lon + (b.lon - a.lon) * r))
+            let leeway = 0.5 * distance_m(a.lat, a.lon, b.lat, b.lon) * (4.0 * r * (1.0 - r)).sqrt();
+            Some(Estimate {
+                lat: a.lat + (b.lat - a.lat) * r,
+                lon: a.lon + (b.lon - a.lon) * r,
+                uncertainty_m: acc(a) + (acc(b) - acc(a)) * r + leeway * 0.5,
+            })
         }
-        (Some(a), _) if ts_ms - a.ts_ms <= max_gap_ms / 2 => Some((a.lat, a.lon)),
-        (_, Some(b)) if b.ts_ms - ts_ms <= max_gap_ms / 2 => Some((b.lat, b.lon)),
+        (Some(a), _) if ts_ms - a.ts_ms <= max_gap_ms / 2 => Some(Estimate {
+            lat: a.lat,
+            lon: a.lon,
+            uncertainty_m: acc(a) + DRIFT_MS * (ts_ms - a.ts_ms) as f64 / 1000.0,
+        }),
+        (_, Some(b)) if b.ts_ms - ts_ms <= max_gap_ms / 2 => Some(Estimate {
+            lat: b.lat,
+            lon: b.lon,
+            uncertainty_m: acc(b) + DRIFT_MS * (b.ts_ms - ts_ms) as f64 / 1000.0,
+        }),
         _ => None,
     }
 }
@@ -502,8 +530,14 @@ mod tests {
     fn interpolation() {
         let fix = |ts_ms, lat| Fix { ts_ms, lat, lon: 4.0, acc_m: None, alt_m: None, speed_ms: None };
         let fixes = [fix(0, 50.0), fix(10_000, 51.0)];
-        assert_eq!(position_at(&fixes, 5_000, 60_000), Some((50.5, 4.0)));
-        assert_eq!(position_at(&fixes, 5_000, 5_000), None);
+        let mid = estimate_at(&fixes, 5_000, 60_000).unwrap();
+        assert_eq!((mid.lat, mid.lon), (50.5, 4.0));
+        assert_eq!(estimate_at(&fixes, 5_000, 5_000), None);
+        let e = estimate_at(&fixes, 5_000, 60_000).unwrap();
+        // half-way between fixes 111 km apart: far less certain than either fix
+        assert!(e.uncertainty_m > 1000.0, "{e:?}");
+        let near = estimate_at(&fixes, 0, 60_000).unwrap();
+        assert_eq!(near.uncertainty_m, DEFAULT_ACC_M);
     }
 }
 

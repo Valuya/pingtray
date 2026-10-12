@@ -16,6 +16,8 @@ pub struct TrayState {
     pub pixmap: (usize, usize, Vec<u8>),
     pub tooltip: String,
     pub config_path: PathBuf,
+    /// Status lines at the top of the menu: GNOME shows no tooltips.
+    pub status: Vec<String>,
     /// Target names, for the "Tray graph" menu.
     pub choices: Vec<String>,
     /// Shared with the collector: 0 = all targets pooled, i + 1 = target i.
@@ -124,7 +126,16 @@ mod sni {
             let mut options: Vec<RadioItem> =
                 self.0.choices.iter().map(|c| RadioItem { label: c.clone(), ..Default::default() }).collect();
             options.push(RadioItem { label: "All targets".into(), ..Default::default() });
-            vec![
+            let mut items: Vec<ksni::MenuItem<Self>> = self
+                .0
+                .status
+                .iter()
+                .map(|line| StandardItem { label: line.replace('_', "__"), enabled: false, ..Default::default() }.into())
+                .collect();
+            if !items.is_empty() {
+                items.push(ksni::MenuItem::Separator);
+            }
+            items.extend(vec![
                 StandardItem {
                     label: "Show graph".into(),
                     activate: Box::new(|t: &mut Self| open_viewer(&t.0.config_path)),
@@ -161,7 +172,8 @@ mod sni {
                     ..Default::default()
                 }
                 .into(),
-            ]
+            ]);
+            items
         }
     }
 

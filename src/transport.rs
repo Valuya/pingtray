@@ -35,14 +35,15 @@ impl Mode {
 
     pub fn rgb(self) -> [u8; 3] {
         match self {
+            // map only, where they replace the quality ramp: kept off it
             Mode::Still => [0x9a, 0x99, 0x96],
-            Mode::Foot => [0x2e, 0xc2, 0x7e],
-            Mode::Bike => [0xf5, 0xc2, 0x11],
-            Mode::Vehicle => [0xc0, 0x61, 0xcb],
-            Mode::Car => [0xe6, 0x61, 0x00],
+            Mode::Foot => [0xff, 0xff, 0xff],
+            Mode::Bike => [0x33, 0xc7, 0xde],
+            Mode::Vehicle => [0xb5, 0xa3, 0xff],
+            Mode::Car => [0xdc, 0x8a, 0xdd],
             Mode::Train => [0x35, 0x84, 0xe4],
-            Mode::Tram => [0x00, 0xa5, 0xa5],
-            Mode::Metro => [0x91, 0x41, 0xac],
+            Mode::Tram => [0x99, 0xc1, 0xf1],
+            Mode::Metro => [0x61, 0x35, 0x83],
         }
     }
 }
@@ -138,6 +139,7 @@ fn percentile(mut v: Vec<f64>, p: f64) -> f64 {
 }
 
 const SMOOTH_MS: i64 = 90_000;
+const SPEED_BASE_MS: i64 = 60_000;
 const MIN_RUN_MS: i64 = 120_000;
 
 /// Splits the track into segments of one transport mode. `rails` is asked
@@ -151,16 +153,31 @@ pub fn classify(
     if fixes.len() < 2 {
         return Vec::new();
     }
-    // speed at each fix, m/s
+    // speed at each fix, m/s: the device's own when it reports one, else the
+    // displacement over about a minute around the fix, so that GPS jitter
+    // (metres from one fix to the next) does not read as movement
     let speeds: Vec<Option<f64>> = (0..fixes.len())
         .map(|i| {
             let f = &fixes[i];
             if let Some(s) = f.speed_ms {
                 return Some(s);
             }
-            let p = fixes.get(i.wrapping_sub(1))?;
-            let dt = (f.ts_ms - p.ts_ms) as f64 / 1000.0;
-            (dt > 0.0 && dt <= 120.0).then(|| distance_m(p.lat, p.lon, f.lat, f.lon) / dt)
+            let lo = fixes.partition_point(|g| g.ts_ms < f.ts_ms - SPEED_BASE_MS / 2);
+            let hi = fixes.partition_point(|g| g.ts_ms <= f.ts_ms + SPEED_BASE_MS / 2).saturating_sub(1);
+            let (a, b) = (&fixes[lo], &fixes[hi.max(lo)]);
+            let dt = (b.ts_ms - a.ts_ms) as f64 / 1000.0;
+            (dt >= 15.0).then(|| {
+                // path length, but not shorter than the straight line minus
+                // the jitter both ends may carry
+                let path: f64 = fixes[lo..=hi.max(lo)]
+                    .windows(2)
+                    .map(|w| distance_m(w[0].lat, w[0].lon, w[1].lat, w[1].lon))
+                    .sum();
+                let straight = distance_m(a.lat, a.lon, b.lat, b.lon);
+                let noise = a.acc_m.unwrap_or(10.0).min(50.0) + b.acc_m.unwrap_or(10.0).min(50.0);
+                // noisy wiggles inflate the path: trust it only up to 1.5x the straight line
+                path.min(straight * 1.5 + noise).max((straight - noise).max(0.0)) / dt
+            })
         })
         .collect();
 
@@ -283,7 +300,12 @@ fn rail_mode(rails: &Rails, track: &[Fix]) -> Mode {
 
 const RAIL_ZOOM: u32 = 12;
 const RAIL_MAX_AGE_MS: i64 = 90 * 86_400_000;
-const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
+/// Public Overpass servers, tried in turn: they are often busy.
+const OVERPASS_URLS: [&str; 3] = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+];
 
 fn tile_of(lat: f64, lon: f64) -> (u32, u32) {
     let n = 2f64.powi(RAIL_ZOOM as i32);
@@ -314,12 +336,25 @@ fn fetch_tile(x: u32, y: u32) -> anyhow::Result<String> {
     let query = format!(
         "[out:json][timeout:60];way[\"railway\"~\"^(rail|light_rail|subway|tram|narrow_gauge)$\"]({s},{w},{n},{e});out geom;"
     );
-    let text = ureq::post(OVERPASS_URL)
-        .header("User-Agent", concat!("pingtray/", env!("CARGO_PKG_VERSION")))
-        .send_form([("data", query.as_str())])?
-        .body_mut()
-        .read_to_string()?;
-    let v: serde_json::Value = serde_json::from_str(&text)?;
+    let mut last_err = anyhow::anyhow!("no Overpass server");
+    let mut v = None;
+    for url in OVERPASS_URLS {
+        let attempt = ureq::post(url)
+            .header("User-Agent", concat!("pingtray/", env!("CARGO_PKG_VERSION")))
+            .send_form([("data", query.as_str())])
+            .map_err(anyhow::Error::from)
+            .and_then(|mut r| Ok(r.body_mut().read_to_string()?))
+            // a busy server answers 200 with an HTML error page
+            .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?));
+        match attempt {
+            Ok(json) => {
+                v = Some(json);
+                break;
+            }
+            Err(e) => last_err = e.context(url),
+        }
+    }
+    let Some(v) = v else { return Err(last_err) };
     let ways: Vec<serde_json::Value> = v["elements"]
         .as_array()
         .into_iter()
@@ -395,6 +430,19 @@ mod tests {
                 speed_ms: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn jittery_walk_is_on_foot() {
+        // 8 m of GPS noise every 5 s used to read as cycling
+        let mut fixes = track(0, 900, 5, 1.3, 4.0);
+        for (i, f) in fixes.iter_mut().enumerate() {
+            let n = ((i * 7919) % 17) as f64 / 17.0 - 0.5;
+            f.lat += n * 16.0 / 110_540.0;
+            f.lon -= n * 12.0 / 71_000.0;
+        }
+        let segs = classify(&fixes, 600_000, |_| Some(Rails::new(&[])));
+        assert_eq!(segs.iter().map(|s| s.mode).collect::<Vec<_>>(), vec![Mode::Foot]);
     }
 
     #[test]

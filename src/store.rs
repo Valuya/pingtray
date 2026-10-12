@@ -18,15 +18,23 @@ pub struct TargetRow {
 }
 
 /// Percentiles kept per bucket, SmokePing style.
-pub const PCTS: [f64; 7] = [0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0];
-pub const MEDIAN: usize = 3;
+/// Every 5 %, so that the smoke can fade smoothly.
+pub const PCTS: [f64; 21] = [
+    0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80,
+    0.85, 0.90, 0.95, 1.0,
+];
+pub const MIN: usize = 0;
+pub const P10: usize = 2;
+pub const MEDIAN: usize = 10;
+pub const P90: usize = 18;
+pub const MAX: usize = 20;
 
 /// Aggregate of the samples falling in one time bucket.
 #[derive(Debug, Clone, Copy)]
 pub struct Bucket {
     pub ts_ms: i64,
     /// RTT at each of [`PCTS`], in ms; `None` when every ping was lost.
-    pub pcts: Option<[f64; 7]>,
+    pub pcts: Option<[f64; 21]>,
     pub count: u32,
     pub lost: u32,
 }

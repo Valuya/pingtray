@@ -4,10 +4,10 @@
 use eframe::egui::{self, Color32, Pos2, RichText, Stroke};
 use walkers::{HttpOptions, HttpTiles, Map, MapMemory, lat_lon, sources::OpenStreetMap};
 
-use crate::location::{Fix, position_at};
+use crate::location::{DEFAULT_ACC_M, Fix, estimate_at};
 use crate::transport::{Mode, Segment};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ColorBy {
     Quality,
     Transport,
@@ -57,7 +57,11 @@ fn fit_zoom(bbox: [f64; 4], size: egui::Vec2) -> f64 {
 }
 
 impl MapView {
-    pub fn new(ctx: &egui::Context) -> MapView {
+    pub fn color_by(&self) -> ColorBy {
+        self.color_by
+    }
+
+    pub fn new(ctx: &egui::Context, color_by: ColorBy) -> MapView {
         let options = HttpOptions {
             cache: Some(crate::config::data_dir().join("tiles")),
             ..Default::default()
@@ -65,7 +69,7 @@ impl MapView {
         MapView {
             tiles: HttpTiles::with_options(OpenStreetMap, options, ctx.clone()),
             memory: MapMemory::default(),
-            color_by: ColorBy::Quality,
+            color_by,
             fitted: None,
         }
     }
@@ -107,29 +111,43 @@ impl MapView {
             .show(ui, |ui, response, projector, _| {
                 let painter = ui.painter_at(response.rect);
                 let pos = |f: &Fix| projector.project(lat_lon(f.lat, f.lon)).to_pos2();
+                let px_per_m = |f: &Fix| projector.scale_pixel_per_meter(lat_lon(f.lat, f.lon));
+                let color_at = |ts: i64| match color_by {
+                    ColorBy::Quality => (input.quality)(ts).unwrap_or(Color32::GRAY),
+                    ColorBy::Transport => mode_at(input.segments, ts).map(mode_color).unwrap_or(Color32::GRAY),
+                };
+                // uncertainty first, underneath: each fix's accuracy as a faint
+                // disc; together they draw the corridor you were somewhere in
+                for f in &visible {
+                    let r = (f.acc_m.unwrap_or(DEFAULT_ACC_M) as f32 * px_per_m(f)).max(2.0);
+                    if r > 4.0 {
+                        painter.circle_filled(pos(f), r, color_at(f.ts_ms).gamma_multiply(0.12));
+                    }
+                }
                 for w in visible.windows(2) {
                     if w[1].ts_ms - w[0].ts_ms > input.max_gap_ms {
                         continue;
                     }
                     let mid = (w[0].ts_ms + w[1].ts_ms) / 2;
-                    let color = match color_by {
-                        ColorBy::Quality => (input.quality)(mid).unwrap_or(Color32::GRAY),
-                        ColorBy::Transport => mode_at(input.segments, mid).map(mode_color).unwrap_or(Color32::GRAY),
-                    };
+                    // a vague fix gets a fainter line
+                    let acc = w[0].acc_m.unwrap_or(DEFAULT_ACC_M).max(w[1].acc_m.unwrap_or(DEFAULT_ACC_M));
+                    let sure = (1.0 - (acc as f32 - 20.0) / 200.0).clamp(0.3, 1.0);
                     let (a, b) = (pos(&w[0]), pos(&w[1]));
-                    painter.line_segment([a, b], Stroke::new(6.0, Color32::from_black_alpha(140)));
-                    painter.line_segment([a, b], Stroke::new(3.5, color));
+                    painter.line_segment([a, b], Stroke::new(6.0, Color32::from_black_alpha((140.0 * sure) as u8)));
+                    painter.line_segment([a, b], Stroke::new(3.5, color_at(mid).gamma_multiply(sure)));
                 }
                 let dot = |p: Pos2, fill: Color32| {
                     painter.circle(p, 5.0, fill, Stroke::new(1.5, Color32::BLACK));
                 };
                 dot(pos(&visible[0]), Color32::WHITE);
                 dot(pos(&visible[visible.len() - 1]), Color32::BLACK);
-                if let Some((lat, lon)) =
-                    input.hover.and_then(|t| position_at(input.fixes, (t * 1000.0) as i64, input.max_gap_ms))
-                {
-                    let p = projector.project(lat_lon(lat, lon)).to_pos2();
-                    painter.circle(p, 8.0, Color32::from_white_alpha(60), Stroke::new(2.5, Color32::WHITE));
+                if let Some(e) = input.hover.and_then(|t| estimate_at(input.fixes, (t * 1000.0) as i64, input.max_gap_ms)) {
+                    // where you were at the hovered time: the circle is the uncertainty
+                    let at = lat_lon(e.lat, e.lon);
+                    let p = projector.project(at).to_pos2();
+                    let r = (e.uncertainty_m as f32 * projector.scale_pixel_per_meter(at)).max(6.0);
+                    painter.circle(p, r, Color32::from_white_alpha(40), Stroke::new(2.0, Color32::WHITE));
+                    painter.circle_filled(p, 3.0, Color32::WHITE);
                 }
                 if response.clicked()
                     && let Some(pointer) = response.interact_pointer_pos()
@@ -148,14 +166,8 @@ impl MapView {
     fn legend(&self, ui: &mut egui::Ui, input: &MapInput<'_>, visible: &[Fix]) {
         ui.horizontal_wrapped(|ui| match self.color_by {
             ColorBy::Quality => {
-                ui.weak("colour = loss if any, else latency:");
-                for (label, c) in [
-                    ("fast", [0x33, 0xd1, 0x7a]),
-                    ("slow", [0xf6, 0xd3, 0x2d]),
-                    ("very slow", [0xff, 0x78, 0x00]),
-                    ("some loss", [0x35, 0x84, 0xe4]),
-                    ("heavy loss", [0xe0, 0x1b, 0x24]),
-                ] {
+                ui.weak("connection:");
+                for (label, c) in crate::colors::RAMP_LEGEND {
                     ui.label(RichText::new(format!("■ {label}")).color(rgb(c)));
                 }
             }
@@ -207,21 +219,23 @@ pub fn mode_strip(
             pui.set_plot_bounds_x(view.0..=view.1);
             pui.set_plot_bounds_y(0.0..=1.0);
             let span = view.1 - view.0;
-            for s in segments {
+            for (i, s) in segments.iter().enumerate() {
                 let (a, b) = (s.from_ms as f64 / 1000.0, s.to_ms as f64 / 1000.0);
                 if b < view.0 || a > view.1 {
                     continue;
                 }
-                let c = mode_color(s.mode);
+                // neutral greys: the charts' colours belong to the destinations
+                let shade = if i % 2 == 0 { 0x5e } else { 0x4a };
+                let c = Color32::from_gray(shade);
                 let pts = PlotPoints::from(vec![[a, 0.1], [b, 0.1], [b, 0.9], [a, 0.9]]);
-                pui.polygon(Polygon::new(s.mode.label(), pts).fill_color(c.gamma_multiply(0.75)).stroke(Stroke::NONE));
+                pui.polygon(Polygon::new(s.mode.label(), pts).fill_color(c).stroke(Stroke::NONE));
                 if (b.min(view.1) - a.max(view.0)) / span > 0.06 {
                     let x = (a.max(view.0) + b.min(view.1)) / 2.0;
                     let label = match s.mode {
                         Mode::Still => s.mode.label().to_string(),
                         m => format!("{} {:.0} km/h", m.label(), s.kmh()),
                     };
-                    pui.text(Text::new(s.mode.label(), egui_plot::PlotPoint::new(x, 0.5), label).color(Color32::BLACK));
+                    pui.text(Text::new(s.mode.label(), egui_plot::PlotPoint::new(x, 0.5), label).color(Color32::from_gray(0xee)));
                 }
             }
         });
