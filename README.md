@@ -52,15 +52,17 @@ the mouse.
 
 ## Battery charging (Linux)
 
-Settings → Power: when you plug in while travelling (moving according to
-the phone's positions, or connected to a network you list, such as the
-phone's hotspot), pingtray switches GNOME's *Battery Charging* to
-*Maximize Charge*; when you unplug, back to *Preserve Battery Health*.
-It uses UPower's charge threshold, the same switch as GNOME's settings,
-and acts only on those changes, so a mode chosen by hand stays until the
-next plug or unplug. A second tray icon shows the battery, its level and
-the mode (MAX, or the threshold like 80%); its menu switches by hand or
-pauses the automatic switching.
+Settings → Power. The battery icon's menu picks the mode:
+
+- **Automatic**: pingtray decides. Maximize Charge when plugged in while
+  travelling (moving according to the phone's positions, or connected to a
+  network you list, such as the phone's hotspot), Preserve Battery Health
+  otherwise. An "A" on the icon shows it.
+- **Maximize charge** / **Preserve battery health**: manual, kept until you
+  pick Automatic again. Changing the mode in GNOME's settings also switches
+  to manual.
+
+It uses UPower's charge threshold, the same switch as GNOME's settings.
 
 ## Phone positions
 

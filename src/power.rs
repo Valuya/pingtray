@@ -1,7 +1,10 @@
 //! Battery charging mode, as in GNOME's "Battery Charging" setting: UPower's
 //! charge threshold. Preserve = stop charging at the threshold (80 %),
-//! Maximize = charge to 100 %. pingtray switches to Maximize when you plug in
-//! while travelling (a socket on the train), and back when you unplug.
+//! Maximize = charge to 100 %.
+//!
+//! Either automatic (pingtray: Maximize when plugged in while travelling, a
+//! socket on the train; Preserve otherwise) or manual (chosen by hand in the
+//! icon's menu, or changed elsewhere such as GNOME's settings: kept as is).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +20,9 @@ use zbus::zvariant::OwnedObjectPath;
 pub struct PowerConfig {
     /// Manage the charging mode (and show the battery icon).
     pub enabled: bool,
-    /// Plugged in while travelling: charge to 100 %.
+    /// In automatic mode: charge to 100 % when plugged in while travelling
+    /// (otherwise preserve).
     pub maximize_when_travelling: bool,
-    /// Unplugged: back to preserving the battery.
-    pub preserve_when_unplugged: bool,
-    /// Not travelling (at start, or when a journey ends): preserve too.
-    pub preserve_when_not_travelling: bool,
     /// Travelling when the phone's positions show a vehicle lately.
     pub moving: bool,
     /// Travelling when connected to one of these networks (e.g. the phone's hotspot).
@@ -34,8 +34,6 @@ impl Default for PowerConfig {
         PowerConfig {
             enabled: false,
             maximize_when_travelling: true,
-            preserve_when_unplugged: true,
-            preserve_when_not_travelling: true,
             moving: true,
             networks: Vec::new(),
         }
@@ -129,32 +127,60 @@ pub enum Action {
     Preserve,
 }
 
-/// Acts on changes only (and once at start), so that a choice made by hand
-/// (in GNOME's settings or the icon's menu) stays until the next change.
+/// Automatic mode's memory, to tell its own changes from changes made elsewhere.
 #[derive(Default)]
-pub struct Policy {
-    plugged: Option<bool>,
-    travelling: bool,
+pub struct Auto {
+    /// Mode last applied (true = preserve), and the inputs it was for.
+    applied: Option<(bool, bool, bool)>,
 }
 
-impl Policy {
-    pub fn step(&mut self, cfg: &PowerConfig, plugged: bool, travelling: bool) -> Option<Action> {
-        let was_plugged = self.plugged.replace(plugged);
-        let first = was_plugged.is_none();
-        let was_travelling = std::mem::replace(&mut self.travelling, travelling);
-        let plugged_in = plugged && was_plugged != Some(true);
-        let started_travelling = plugged && travelling && !was_travelling;
-        if cfg.maximize_when_travelling && plugged && travelling && (plugged_in || started_travelling) {
-            return Some(Action::Maximize);
-        }
-        if cfg.preserve_when_unplugged && !plugged && was_plugged == Some(true) {
-            return Some(Action::Preserve);
-        }
-        if cfg.preserve_when_not_travelling && !travelling && (first || was_travelling) {
-            return Some(Action::Preserve);
-        }
-        None
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Already as wanted.
+    Keep,
+    /// Switch to this mode.
+    Apply(Action),
+    /// Changed elsewhere since we set it, while nothing changed here: the
+    /// user chose by hand, go manual.
+    ChangedElsewhere,
+}
+
+impl Auto {
+    pub fn want(cfg: &PowerConfig, plugged: bool, travelling: bool) -> Action {
+        if cfg.maximize_when_travelling && plugged && travelling { Action::Maximize } else { Action::Preserve }
     }
+
+    pub fn step(&mut self, cfg: &PowerConfig, plugged: bool, travelling: bool, preserving: bool) -> Step {
+        let want = Self::want(cfg, plugged, travelling);
+        let want_preserve = want == Action::Preserve;
+        if preserving == want_preserve {
+            self.applied = Some((want_preserve, plugged, travelling));
+            return Step::Keep;
+        }
+        if self.applied == Some((want_preserve, plugged, travelling)) {
+            return Step::ChangedElsewhere;
+        }
+        self.applied = Some((want_preserve, plugged, travelling));
+        Step::Apply(want)
+    }
+
+    /// Forget: after switching back to automatic, apply without second-guessing.
+    pub fn reset(&mut self) {
+        self.applied = None;
+    }
+}
+
+fn mode_file() -> std::path::PathBuf {
+    crate::config::data_dir().join("power_mode")
+}
+
+/// Automatic unless the last choice was manual.
+pub fn load_automatic() -> bool {
+    std::fs::read_to_string(mode_file()).map_or(true, |s| s.trim() != "manual")
+}
+
+pub fn save_automatic(automatic: bool) {
+    let _ = std::fs::write(mode_file(), if automatic { "automatic" } else { "manual" });
 }
 
 /// Recent positions show a vehicle (no railway lookup: train or car alike).
@@ -176,21 +202,31 @@ fn moving_lately(store: &crate::store::Store, max_gap_ms: i64) -> bool {
 
 pub struct Status {
     pub battery: Battery,
+    pub automatic: bool,
     /// Why we count as travelling; `None` when not travelling.
     pub reason: Option<String>,
     pub last_action: Option<(Action, String)>,
 }
 
-/// Polls the battery and the travel signals; applies the policy unless paused.
-/// `report` receives the state after every poll.
-pub fn spawn(cfg: PowerConfig, max_gap_ms: i64, paused: Arc<AtomicBool>, mut report: impl FnMut(&Status) + Send + 'static) {
+/// Set to make the power loop read the battery again right away.
+static POKE: AtomicBool = AtomicBool::new(false);
+
+pub fn poke() {
+    POKE.store(true, Ordering::Relaxed);
+}
+
+/// Polls the battery and the travel signals; in automatic mode, applies the
+/// rule. `automatic` is shared with the icon's menu. `report` receives the
+/// state after every poll.
+pub fn spawn(cfg: PowerConfig, max_gap_ms: i64, automatic: Arc<AtomicBool>, mut report: impl FnMut(&Status) + Send + 'static) {
     std::thread::spawn(move || {
         let upower = match Upower::connect() {
             Ok(u) => u,
             Err(e) => return tracing::warn!("battery charging mode: {e}"),
         };
         let store = crate::store::Store::open(&crate::config::db_path()).ok();
-        let mut policy = Policy::default();
+        let mut auto = Auto::default();
+        let mut was_automatic = false;
         let mut last_action = None;
         loop {
             match upower.read() {
@@ -204,37 +240,64 @@ pub fn spawn(cfg: PowerConfig, max_gap_ms: i64, paused: Arc<AtomicBool>, mut rep
                         (false, Some(n)) => Some(format!("on {n}")),
                         _ => None,
                     };
-                    if let Some(action) = policy.step(&cfg, battery.plugged, travelling)
-                        && !paused.load(Ordering::Relaxed)
-                    {
-                        let why = if action == Action::Maximize {
-                            format!("plugged in while travelling ({})", reason.clone().unwrap_or_default())
-                        } else {
-                            "unplugged".to_string()
-                        };
-                        match upower.set_preserve(action == Action::Preserve) {
-                            Ok(()) => {
-                                tracing::info!("charging: {action:?}, {why}");
-                                last_action = Some((action, why));
+                    let is_automatic = automatic.load(Ordering::Relaxed);
+                    if is_automatic && !was_automatic {
+                        auto.reset();
+                    }
+                    was_automatic = is_automatic;
+                    if is_automatic {
+                        match auto.step(&cfg, battery.plugged, travelling, battery.preserve) {
+                            Step::Keep => {}
+                            Step::Apply(action) => {
+                                let why = match (action, &reason) {
+                                    (Action::Maximize, Some(r)) => format!("plugged in while travelling ({r})"),
+                                    (Action::Maximize, None) => "plugged in while travelling".to_string(),
+                                    (Action::Preserve, _) if !battery.plugged => "on battery".to_string(),
+                                    (Action::Preserve, _) => "not travelling".to_string(),
+                                };
+                                match upower.set_preserve(action == Action::Preserve) {
+                                    Ok(()) => {
+                                        tracing::info!("charging: {action:?}, {why}");
+                                        last_action = Some((action, why));
+                                    }
+                                    Err(e) => tracing::error!("{e:#}"),
+                                }
                             }
-                            Err(e) => tracing::error!("{e:#}"),
+                            Step::ChangedElsewhere => {
+                                tracing::info!("charging mode changed elsewhere: manual");
+                                automatic.store(false, Ordering::Relaxed);
+                                save_automatic(false);
+                                was_automatic = false;
+                            }
                         }
                     }
                     let battery = upower.read().unwrap_or(battery);
-                    report(&Status { battery, reason, last_action: last_action.clone() });
+                    let automatic = automatic.load(Ordering::Relaxed);
+                    report(&Status { battery, automatic, reason, last_action: last_action.clone() });
                 }
                 Err(e) => tracing::warn!("reading the battery: {e}"),
             }
-            std::thread::sleep(Duration::from_secs(10));
+            // every 10 s, or at once after a change from the menu
+            for _ in 0..40 {
+                if POKE.swap(false, Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
         }
     });
 }
 
-/// Manual switch, from the icon's menu.
+/// Manual choice, from the icon's menu. On its own thread: the menu runs
+/// inside the async runtime, where zbus's blocking calls must not run.
 pub fn set_mode(preserve: bool) {
-    if let Err(e) = Upower::connect().and_then(|u| u.set_preserve(preserve)) {
-        tracing::error!("{e:#}");
-    }
+    std::thread::spawn(move || {
+        match Upower::connect().and_then(|u| u.set_preserve(preserve)) {
+            Ok(()) => tracing::info!("charging set by hand: {}", if preserve { "preserve" } else { "maximize" }),
+            Err(e) => tracing::error!("{e:#}"),
+        }
+        poke();
+    });
 }
 
 #[cfg(test)]
@@ -242,35 +305,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plug_in_on_the_train_then_unplug() {
+    fn automatic_follows_plug_and_travel() {
         let cfg = PowerConfig { enabled: true, ..Default::default() };
-        let mut p = Policy::default();
-        assert_eq!(p.step(&cfg, false, true), None); // starts on the train, on battery
-        assert_eq!(p.step(&cfg, true, true), Some(Action::Maximize)); // found a socket
-        assert_eq!(p.step(&cfg, true, true), None); // no repeat: manual changes stay
-        assert_eq!(p.step(&cfg, false, true), Some(Action::Preserve)); // unplugged
-        assert_eq!(p.step(&cfg, true, false), Some(Action::Preserve)); // home: journey over
+        let mut a = Auto::default();
+        // at home, plugged, set to maximize before: preserve
+        assert_eq!(a.step(&cfg, true, false, false), Step::Apply(Action::Preserve));
+        assert_eq!(a.step(&cfg, true, false, true), Step::Keep);
+        // on the train, on battery, then a socket
+        assert_eq!(a.step(&cfg, false, true, true), Step::Keep);
+        assert_eq!(a.step(&cfg, true, true, true), Step::Apply(Action::Maximize));
+        assert_eq!(a.step(&cfg, true, true, false), Step::Keep);
+        // unplugged
+        assert_eq!(a.step(&cfg, false, true, false), Step::Apply(Action::Preserve));
     }
 
     #[test]
-    fn at_home_preserves_at_start_and_after_a_journey() {
+    fn a_change_made_elsewhere_means_manual() {
         let cfg = PowerConfig::default();
-        let mut p = Policy::default();
-        assert_eq!(p.step(&cfg, true, false), Some(Action::Preserve)); // starts at home
-        assert_eq!(p.step(&cfg, true, false), None); // manual MAX stays
-        assert_eq!(p.step(&cfg, true, true), Some(Action::Maximize));
-        assert_eq!(p.step(&cfg, true, false), Some(Action::Preserve)); // journey over
-        let off = PowerConfig { preserve_when_not_travelling: false, ..Default::default() };
-        assert_eq!(Policy::default().step(&off, true, false), None);
-    }
-
-    #[test]
-    fn plugged_in_then_the_journey_starts() {
-        let cfg = PowerConfig { preserve_when_not_travelling: false, ..Default::default() };
-        let mut p = Policy::default();
-        assert_eq!(p.step(&cfg, true, false), None);
-        assert_eq!(p.step(&cfg, true, true), Some(Action::Maximize));
-        let cfg = PowerConfig { preserve_when_unplugged: false, ..Default::default() };
-        assert_eq!(p.step(&cfg, false, true), None);
+        let mut a = Auto::default();
+        assert_eq!(a.step(&cfg, true, true, true), Step::Apply(Action::Maximize));
+        assert_eq!(a.step(&cfg, true, true, false), Step::Keep);
+        // GNOME's settings switched it back while nothing changed here
+        assert_eq!(a.step(&cfg, true, true, true), Step::ChangedElsewhere);
+        // back to automatic: applies again
+        a.reset();
+        assert_eq!(a.step(&cfg, true, true, true), Step::Apply(Action::Maximize));
     }
 }

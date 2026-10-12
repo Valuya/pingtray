@@ -222,22 +222,23 @@ fn restart() {
 async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: bool) {
     use crate::power::{Action, Status};
     use crate::tray::{PowerTrayHandle, PowerTrayState};
-    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let base = PowerTrayState { paused: paused.clone(), config_path: config_path.to_path_buf(), threshold: 80, ..Default::default() };
+    let automatic = Arc::new(std::sync::atomic::AtomicBool::new(crate::power::load_automatic()));
+    let base = PowerTrayState { automatic: automatic.clone(), config_path: config_path.to_path_buf(), threshold: 80, ..Default::default() };
     let handle = if with_tray { PowerTrayHandle::spawn(base.clone()).await } else { None };
     let mut sink = IconSink::new(&config::runtime_dir().join("power-icons")).ok();
     let rt = tokio::runtime::Handle::current();
     let height = cfg.icon_height;
-    crate::power::spawn(cfg.power.clone(), cfg.location.max_gap_ms(), paused, move |s: &Status| {
+    crate::power::spawn(cfg.power.clone(), cfg.location.max_gap_ms(), automatic, move |s: &Status| {
         let Some(handle) = &handle else { return };
         let b = s.battery;
         let (w, h, rgba) = icon::render_battery(b.percentage, b.preserve, b.end_threshold, b.charging, height);
-        let svg = crate::svg_icon::battery(b.percentage, b.preserve, b.end_threshold, b.charging, height as f64);
+        let svg = crate::svg_icon::battery(b.percentage, b.preserve, b.end_threshold, b.charging, s.automatic, height as f64);
         let icon_file = sink.as_mut().and_then(|k| k.write_svg(&svg).ok());
+        let how = if s.automatic { "Automatic" } else { "Manual" };
         let mode = if b.preserve {
-            format!("Preserve battery health: stops at {} %", b.end_threshold)
+            format!("{how}: preserve battery health, stops at {} %", b.end_threshold)
         } else {
-            "Maximize charge: charges to 100 %".to_string()
+            format!("{how}: maximize charge, charges to 100 %")
         };
         let power = match (b.plugged, b.charging) {
             (true, true) => "plugged in, charging",
@@ -249,7 +250,7 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
             Some(r) => format!("Travelling ({r})"),
             None => "Not travelling".to_string(),
         });
-        if let Some((action, why)) = &s.last_action {
+        if let (true, Some((action, why))) = (s.automatic, &s.last_action) {
             let what = if *action == Action::Maximize { "Switched to maximize" } else { "Switched to preserve" };
             status.push(format!("{what}: {why}"));
         }

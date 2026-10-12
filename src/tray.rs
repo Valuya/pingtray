@@ -242,8 +242,8 @@ pub struct PowerTrayState {
     pub status: Vec<String>,
     pub preserve: bool,
     pub threshold: u32,
-    /// Shared with the power loop: automatic switching paused from the menu.
-    pub paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the power loop: automatic (pingtray decides) or manual.
+    pub automatic: Arc<std::sync::atomic::AtomicBool>,
     pub config_path: PathBuf,
 }
 
@@ -277,7 +277,7 @@ mod power_sni {
             ksni::ToolTip { title: "Battery charging".into(), description: self.0.status.join("\n"), ..Default::default() }
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-            use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem};
+            use ksni::menu::{RadioGroup, RadioItem, StandardItem};
             let mut items: Vec<ksni::MenuItem<Self>> = self
                 .0
                 .status
@@ -285,33 +285,29 @@ mod power_sni {
                 .map(|line| StandardItem { label: line.replace('_', "__"), enabled: false, ..Default::default() }.into())
                 .collect();
             items.push(ksni::MenuItem::Separator);
+            let automatic = self.0.automatic.load(Ordering::Relaxed);
             items.push(
                 RadioGroup {
-                    selected: usize::from(self.0.preserve),
+                    selected: if automatic { 0 } else if self.0.preserve { 2 } else { 1 },
                     select: Box::new(|t: &mut Self, i: usize| {
-                        crate::power::set_mode(i == 1);
-                        t.0.preserve = i == 1;
+                        let automatic = i == 0;
+                        t.0.automatic.store(automatic, Ordering::Relaxed);
+                        crate::power::save_automatic(automatic);
+                        if automatic {
+                            crate::power::poke();
+                        } else {
+                            t.0.preserve = i == 2;
+                            crate::power::set_mode(i == 2);
+                        }
                     }),
                     options: vec![
+                        RadioItem { label: "Automatic".into(), ..Default::default() },
                         RadioItem { label: "Maximize charge".into(), ..Default::default() },
                         RadioItem {
                             label: format!("Preserve battery health ({} %)", self.0.threshold),
                             ..Default::default()
                         },
                     ],
-                }
-                .into(),
-            );
-            items.push(ksni::MenuItem::Separator);
-            items.push(
-                CheckmarkItem {
-                    label: "Switch automatically".into(),
-                    checked: !self.0.paused.load(Ordering::Relaxed),
-                    activate: Box::new(|t: &mut Self| {
-                        let paused = t.0.paused.load(Ordering::Relaxed);
-                        t.0.paused.store(!paused, Ordering::Relaxed);
-                    }),
-                    ..Default::default()
                 }
                 .into(),
             );

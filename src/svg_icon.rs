@@ -134,7 +134,7 @@ pub fn ping(data: &IconData, height: f64, th: Thresholds) -> String {
 /// Battery with its charge, a bolt while charging, and the mode as a
 /// symbol: arrow up to the top for Maximize, a heart for Preserve (with a
 /// tick where charging stops).
-pub fn battery(percentage: f64, preserve: bool, threshold: u32, charging: bool, height: f64) -> String {
+pub fn battery(percentage: f64, preserve: bool, threshold: u32, charging: bool, automatic: bool, height: f64) -> String {
     let h = height;
     let body_h = h * 0.62;
     let body_w = h * 1.25;
@@ -200,6 +200,16 @@ pub fn battery(percentage: f64, preserve: bool, threshold: u32, charging: bool, 
     }
     // the mode
     let (sx, sy, u) = (bx + body_w + nub_w + gap, (h - sym) / 2.0, sym / 10.0);
+    if automatic {
+        // "A" badge: pingtray decides
+        let _ = write!(
+            s,
+            r#"<text x="{:.2}" y="{:.2}" text-anchor="middle" font-family="{FONT}" font-weight="800" font-size="{:.2}" fill="{WHITE}">A</text>"#,
+            sx + sym - h * 0.08,
+            h * 0.36,
+            h * 0.36
+        );
+    }
     let p = |x: f64, y: f64| format!("{:.2},{:.2}", sx + x * u, sy + y * u);
     if preserve {
         let _ = write!(
@@ -255,7 +265,7 @@ mod tests {
         let th = Thresholds { warn_ms: 60.0, bad_ms: 200.0 };
         let svg = ping(&data, 20.0, th);
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>") && svg.contains(">28<"));
-        let b = battery(62.0, true, 80, true, 20.0);
+        let b = battery(62.0, true, 80, true, true, 20.0);
         assert!(b.contains("<path") && b.contains("<polygon"));
     }
 }

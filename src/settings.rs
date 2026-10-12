@@ -283,13 +283,10 @@ impl SettingsApp {
         );
         ui.add_space(8.0);
         ui.add_enabled_ui(p.enabled, |ui| {
+            ui.label(RichText::new("Automatic mode").strong());
             ui.checkbox(&mut p.maximize_when_travelling, "Maximize charge when plugged in while travelling");
             ui.weak("Typically: you found a socket on the train and want a full battery.");
-            ui.checkbox(&mut p.preserve_when_unplugged, "Back to Preserve Battery Health when unplugged");
-            ui.checkbox(
-                &mut p.preserve_when_not_travelling,
-                "Preserve Battery Health whenever not travelling (at start, and when a journey ends)",
-            );
+            ui.weak("Otherwise (unplugged, or not travelling): Preserve Battery Health.");
             ui.add_space(8.0);
             ui.label(RichText::new("Travelling means").strong());
             ui.checkbox(&mut p.moving, "Moving in a vehicle, according to the phone's positions (last 10 minutes)");
@@ -320,8 +317,9 @@ impl SettingsApp {
             });
             ui.add_space(8.0);
             ui.weak(
-                "pingtray switches only when something changes (plugging in, unplugging, a journey \
-                 starting or ending) and once at start: a mode you choose by hand stays until then.",
+                "The battery icon's menu chooses Automatic, or a mode by hand (manual: kept until you \
+                 pick Automatic again). Changing the mode in GNOME's settings also switches to manual. \
+                 An \"A\" on the icon means automatic.",
             );
         });
     }
