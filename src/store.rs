@@ -1,6 +1,7 @@
 //! SQLite history. One writer (the collector), any number of readers (viewers).
 
 use std::path::Path;
+use crate::location::Fix;
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -37,7 +38,7 @@ impl Bucket {
 }
 
 /// Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
@@ -66,6 +67,32 @@ impl Store {
                      rtt_us    INTEGER,
                      PRIMARY KEY (target_id, ts_ms)
                  ) WITHOUT ROWID;",
+            )?;
+        }
+        if version < 2 {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS location (
+                     ts_ms    INTEGER NOT NULL,
+                     source   TEXT NOT NULL,
+                     lat      REAL NOT NULL,
+                     lon      REAL NOT NULL,
+                     acc_m    REAL,
+                     alt_m    REAL,
+                     speed_ms REAL,
+                     PRIMARY KEY (ts_ms, source)
+                 ) WITHOUT ROWID;
+                 -- files already imported from the watched folder, by size and mtime
+                 CREATE TABLE IF NOT EXISTS imported_file (
+                     path  TEXT PRIMARY KEY,
+                     stamp TEXT NOT NULL
+                 );
+                 -- OpenStreetMap railways, per tile, for the transport guess
+                 CREATE TABLE IF NOT EXISTS rail_tile (
+                     z INTEGER NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL,
+                     fetched_ms INTEGER NOT NULL,
+                     ways TEXT NOT NULL,
+                     PRIMARY KEY (z, x, y)
+                 );",
             )?;
         }
         if version < SCHEMA_VERSION {
@@ -117,6 +144,85 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+
+    /// Inserts positions; returns how many were new.
+    pub fn insert_fixes(&mut self, fixes: &[Fix], source: &str) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut added = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO location(ts_ms, source, lat, lon, acc_m, alt_m, speed_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for f in fixes {
+                added += stmt.execute(params![f.ts_ms, source, f.lat, f.lon, f.acc_m, f.alt_m, f.speed_ms])?;
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// Positions in `[from_ms, to_ms)`, sorted by time; when several sources
+    /// report the same instant, the most accurate wins.
+    pub fn fixes(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Fix>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ts_ms, lat, lon, acc_m, alt_m, speed_ms FROM location
+             WHERE ts_ms >= ?1 AND ts_ms < ?2 ORDER BY ts_ms, COALESCE(acc_m, 1e9)",
+        )?;
+        let rows = stmt.query_map(params![from_ms, to_ms], |r| {
+            Ok(Fix {
+                ts_ms: r.get(0)?,
+                lat: r.get(1)?,
+                lon: r.get(2)?,
+                acc_m: r.get(3)?,
+                alt_m: r.get(4)?,
+                speed_ms: r.get(5)?,
+            })
+        })?;
+        let mut out: Vec<Fix> = rows.collect::<Result<_, _>>()?;
+        out.dedup_by_key(|f| f.ts_ms);
+        Ok(out)
+    }
+
+    pub fn has_fixes(&self) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM location)", [], |r| r.get(0))?)
+    }
+
+    pub fn file_stamp(&self, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT stamp FROM imported_file WHERE path = ?1", [path], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_file_stamp(&self, path: &str, stamp: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO imported_file(path, stamp) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET stamp = excluded.stamp",
+            params![path, stamp],
+        )?;
+        Ok(())
+    }
+
+    /// Cached railway geometry of a tile (JSON) and when it was fetched.
+    pub fn rail_tile(&self, z: u32, x: u32, y: u32) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT fetched_ms, ways FROM rail_tile WHERE z = ?1 AND x = ?2 AND y = ?3",
+                params![z, x, y],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_rail_tile(&self, z: u32, x: u32, y: u32, fetched_ms: i64, ways: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO rail_tile(z, x, y, fetched_ms, ways) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![z, x, y, fetched_ms, ways],
+        )?;
+        Ok(())
+    }
     pub fn purge_before(&self, ts_ms: i64) -> Result<usize> {
         Ok(self.conn.execute("DELETE FROM sample WHERE ts_ms < ?1", [ts_ms])?)
     }

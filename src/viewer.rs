@@ -13,7 +13,11 @@ use egui_plot::{FilledArea, GridInput, GridMark, HoverPosition, Line, Plot, Plot
 use crate::config::Config;
 use crate::pinger::now_ms;
 use crate::icon::percentile;
+use crate::icon::Thresholds;
+use crate::location::Fix;
+use crate::map::{MapInput, MapView};
 use crate::store::{Bucket, MEDIAN, Store, TargetRow};
+use crate::transport::{self, Segment};
 
 const SPANS: &[(&str, f64)] = &[
     ("5 min", 300.0),
@@ -29,7 +33,9 @@ const STEPS: &[f64] = &[
     1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0,
     10_800.0, 21_600.0, 43_200.0, 86_400.0, 172_800.0, 604_800.0, 2_592_000.0,
 ];
-const MAX_POINTS: f64 = 1200.0;
+const MAX_POINTS: f64 = 500.0;
+/// Pings per point at least, so that the smoke means something.
+const MIN_PINGS_PER_POINT: f64 = 5.0;
 const MIN_SPAN: f64 = 30.0;
 const MAX_SPAN: f64 = 400.0 * 86_400.0;
 const PALETTE: [Color32; 8] = [
@@ -60,10 +66,19 @@ struct Query {
 struct Answer {
     query: Query,
     data: HashMap<i64, Vec<Bucket>>,
+    /// Positions around the range, sorted by time.
+    fixes: Vec<Fix>,
+}
+
+enum Msg {
+    Data(Answer),
+    Modes(Vec<Segment>),
 }
 
 pub struct ViewerApp {
     interval_secs: f64,
+    thresholds: Thresholds,
+    max_gap_ms: i64,
     targets: Vec<TargetView>,
     first_sample_s: Option<f64>,
     /// Visible time range, unix seconds.
@@ -71,18 +86,52 @@ pub struct ViewerApp {
     /// When set, the right edge sticks to "now".
     follow: bool,
     log_y: bool,
+    /// One chart per target instead of one for all.
+    split: bool,
     loaded: Option<Answer>,
+    segments: Vec<Segment>,
+    has_fixes: bool,
+    map: Option<MapView>,
+    /// Time under the mouse in the charts.
+    hover_x: Option<f64>,
     sent: Option<Query>,
     sent_at: Instant,
     req_tx: mpsc::Sender<Query>,
-    ans_rx: mpsc::Receiver<Answer>,
+    ans_rx: mpsc::Receiver<Msg>,
     /// Debug aid: save a screenshot of the window to this path, then quit.
     snapshot: Option<(PathBuf, u32)>,
 }
 
-fn spawn_worker(db: PathBuf, ctx: egui::Context) -> (mpsc::Sender<Query>, mpsc::Receiver<Answer>) {
+fn spawn_worker(db: PathBuf, max_gap_ms: i64, ctx: egui::Context) -> (mpsc::Sender<Query>, mpsc::Receiver<Msg>) {
     let (req_tx, req_rx) = mpsc::channel::<Query>();
     let (ans_tx, ans_rx) = mpsc::channel();
+    let (modes_tx, modes_rx) = mpsc::channel::<Vec<Fix>>();
+
+    // Transport modes may need railway data from the network: own thread,
+    // so that the charts never wait for it.
+    let modes_db = db.clone();
+    let modes_ans = ans_tx.clone();
+    let modes_ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let Ok(store) = Store::open(&modes_db) else { return };
+        let mut last_key = None;
+        while let Ok(mut fixes) = modes_rx.recv() {
+            while let Ok(newer) = modes_rx.try_recv() {
+                fixes = newer;
+            }
+            let key = (fixes.len(), fixes.first().map(|f| f.ts_ms), fixes.last().map(|f| f.ts_ms));
+            if last_key == Some(key) {
+                continue;
+            }
+            last_key = Some(key);
+            let segments = transport::classify(&fixes, max_gap_ms, |track| transport::rails_for(&store, track));
+            if modes_ans.send(Msg::Modes(segments)).is_err() {
+                return;
+            }
+            modes_ctx.request_repaint();
+        }
+    });
+
     std::thread::spawn(move || {
         let store = match Store::open(&db) {
             Ok(s) => s,
@@ -104,7 +153,14 @@ fn spawn_worker(db: PathBuf, ctx: egui::Context) -> (mpsc::Sender<Query>, mpsc::
                     (id, b)
                 })
                 .collect();
-            if ans_tx.send(Answer { query: q, data }).is_err() {
+            let fixes = store.fixes(q.from_ms - max_gap_ms, q.to_ms + max_gap_ms).unwrap_or_else(|e| {
+                tracing::error!("positions: {e}");
+                Vec::new()
+            });
+            if !fixes.is_empty() {
+                let _ = modes_tx.send(fixes.clone());
+            }
+            if ans_tx.send(Msg::Data(Answer { query: q, data, fixes })).is_err() {
                 return;
             }
             ctx.request_repaint();
@@ -133,16 +189,25 @@ impl ViewerApp {
             t.color = PALETTE[i % PALETTE.len()];
         }
         let first_sample_s = store.first_sample_ms()?.map(|ms| ms as f64 / 1000.0);
-        let (req_tx, ans_rx) = spawn_worker(db, cc.egui_ctx.clone());
+        let has_fixes = store.has_fixes()?;
+        let max_gap_ms = cfg.location.max_gap_ms();
+        let (req_tx, ans_rx) = spawn_worker(db, max_gap_ms, cc.egui_ctx.clone());
         let now = now_ms() as f64 / 1000.0;
         Ok(ViewerApp {
             interval_secs: cfg.interval_secs,
+            thresholds: Thresholds { warn_ms: cfg.warn_ms, bad_ms: cfg.bad_ms },
+            max_gap_ms,
             targets,
             first_sample_s,
             view: (now - 3600.0, now),
             follow: true,
             log_y: false,
+            split: false,
             loaded: None,
+            segments: Vec::new(),
+            has_fixes,
+            map: None,
+            hover_x: None,
             sent: None,
             sent_at: Instant::now(),
             req_tx,
@@ -156,7 +221,7 @@ impl ViewerApp {
     }
 
     fn bucket_secs(&self) -> f64 {
-        let want = (self.span() / MAX_POINTS).max(self.interval_secs);
+        let want = (self.span() / MAX_POINTS).max(self.interval_secs * MIN_PINGS_PER_POINT);
         STEPS.iter().copied().find(|&s| s >= want).unwrap_or(*STEPS.last().unwrap())
     }
 
@@ -209,6 +274,13 @@ impl ViewerApp {
             ui.separator();
             ui.checkbox(&mut self.follow, "Live");
             ui.checkbox(&mut self.log_y, "Log scale");
+            ui.checkbox(&mut self.split, "Split").on_hover_text("One chart per target");
+            if self.has_fixes {
+                let mut on = self.map.is_some();
+                if ui.checkbox(&mut on, "Map").changed() {
+                    self.map = on.then(|| MapView::new(ui.ctx()));
+                }
+            }
             ui.separator();
             for t in &mut self.targets {
                 let label = RichText::new(&t.row.name).color(t.color).strong();
@@ -255,70 +327,90 @@ impl ViewerApp {
         let bucket_s = answer.query.bucket_ms as f64 / 1000.0;
         let view = self.view;
         let log_y = self.log_y;
-        let smoke = ui.visuals().strong_text_color();
-        let n = shown.len();
+        let grey = ui.visuals().strong_text_color();
+        // one chart with every target, or one chart each
+        let groups: Vec<Vec<&TargetView>> =
+            if self.split { shown.iter().map(|t| vec![*t]).collect() } else { vec![shown.clone()] };
+        let n = groups.len();
         let header_h = 24.0;
-        let per_plot = ((ui.available_height() - n as f32 * header_h) / n as f32 - 4.0).max(80.0);
+        let strip_h = if self.segments.is_empty() { 0.0 } else { 30.0 };
+        let per_plot = ((ui.available_height() - strip_h - n as f32 * header_h) / n as f32 - 4.0).max(80.0);
 
         let mut dragged_to = None;
         let mut hover: Option<(Option<f64>, f32)> = None;
         let mut double_clicked = false;
 
-        {
-            for (i, t) in shown.iter().enumerate() {
-                let empty = Vec::new();
-                let buckets = answer.data.get(&t.row.id).unwrap_or(&empty);
-                let visible: Vec<&Bucket> = buckets
-                    .iter()
-                    .filter(|b| {
-                        let x = b.ts_ms as f64 / 1000.0;
-                        x + bucket_s >= view.0 && x <= view.1
-                    })
-                    .collect();
-                header(ui, t, &visible);
+        if !self.segments.is_empty() {
+            crate::map::mode_strip(ui, &self.segments, view, 48.0);
+        }
 
-                let (y_min, y_max) = y_range(&visible, log_y);
-                let to_ms = move |y: f64| if log_y { 10f64.powf(y) } else { y };
-                let yv = move |ms: f64| if log_y { ms.max(0.1).log10() } else { ms };
-                let last = i + 1 == n;
-                let hover_text = |hp: &HoverPosition<'_>| -> Option<String> {
-                    let x = match hp {
-                        HoverPosition::NearDataPoint { position, .. } => position.x,
-                        HoverPosition::Elsewhere { position } => position.x,
-                    };
-                    Some(describe_bucket(buckets, x, bucket_s))
+        let empty = Vec::new();
+        for (i, group) in groups.iter().enumerate() {
+            let series: Vec<(&TargetView, &Vec<Bucket>)> =
+                group.iter().map(|t| (*t, answer.data.get(&t.row.id).unwrap_or(&empty))).collect();
+            let in_view = |b: &&Bucket| {
+                let x = b.ts_ms as f64 / 1000.0;
+                x + bucket_s >= view.0 && x <= view.1
+            };
+            ui.horizontal(|ui| {
+                for (t, buckets) in &series {
+                    let visible: Vec<&Bucket> = buckets.iter().filter(in_view).collect();
+                    header(ui, t, &visible);
+                    ui.add_space(12.0);
+                }
+            });
+            let all_visible: Vec<&Bucket> =
+                series.iter().flat_map(|(_, b)| b.iter().filter(in_view)).collect();
+            let (y_min, y_max) = y_range(&all_visible, log_y);
+            let to_ms = move |y: f64| if log_y { 10f64.powf(y) } else { y };
+            let yv = move |ms: f64| if log_y { ms.max(0.1).log10() } else { ms };
+            let last = i + 1 == n;
+            let single = series.len() == 1;
+            let hover_text = |hp: &HoverPosition<'_>| -> Option<String> {
+                let x = match hp {
+                    HoverPosition::NearDataPoint { position, .. } => position.x,
+                    HoverPosition::Elsewhere { position } => position.x,
                 };
-                let plot = Plot::new(("rtt", t.row.id))
-                    .height(per_plot)
-                    .allow_zoom(false)
-                    .allow_scroll(false)
-                    .allow_drag([true, false])
-                    .allow_double_click_reset(false)
-                    .show_axes([last, true])
-                    .x_grid_spacer(time_grid)
-                    .x_axis_formatter(|m, _| fmt_axis(m))
-                    .y_axis_formatter(move |m, _| fmt_ms(to_ms(m.value)))
-                    .y_grid_spacer(value_grid)
-                    .y_axis_min_width(48.0)
-                    .label_formatter(hover_text)
-                    .link_cursor("time", [true, false]);
-                let r = plot.show(ui, |pui| {
-                    if !pui.response().dragged() {
-                        pui.set_plot_bounds_x(view.0..=view.1);
-                    }
-                    pui.set_auto_bounds([false, false]);
-                    pui.set_plot_bounds_y(y_min..=y_max);
-                    draw_target(pui, buckets, bucket_s, smoke, yv, &t.row.name);
-                    (pui.plot_bounds(), pui.pointer_coordinate())
-                });
-                if r.response.dragged() {
-                    dragged_to = Some((r.inner.0.min()[0], r.inner.0.max()[0]));
+                Some(describe_buckets(&series, x, bucket_s))
+            };
+            let plot = Plot::new(("rtt", group.iter().map(|t| t.row.id).collect::<Vec<_>>()))
+                .height(per_plot)
+                .allow_zoom(false)
+                .allow_scroll(false)
+                .allow_drag([true, false])
+                .allow_double_click_reset(false)
+                .show_axes([last, true])
+                .x_grid_spacer(time_grid)
+                .x_axis_formatter(|m, _| fmt_axis(m))
+                .y_axis_formatter(move |m, _| fmt_ms(to_ms(m.value)))
+                .y_grid_spacer(value_grid)
+                .y_axis_min_width(48.0)
+                .label_formatter(hover_text)
+                .link_cursor("time", [true, false]);
+            let r = plot.show(ui, |pui| {
+                if !pui.response().dragged() {
+                    pui.set_plot_bounds_x(view.0..=view.1);
                 }
-                if r.response.hovered() {
-                    hover = Some((r.inner.1.map(|p| p.x), r.response.rect.width()));
+                pui.set_auto_bounds([false, false]);
+                pui.set_plot_bounds_y(y_min..=y_max);
+                for (t, buckets) in &series {
+                    // alone: grey smoke and a median coloured by loss, as in
+                    // SmokePing; together: each target in its own colour
+                    let (smoke, median) = if single { (grey, None) } else { (t.color, Some(t.color)) };
+                    draw_target(pui, buckets, bucket_s, smoke, median, yv, &t.row.name);
                 }
-                double_clicked |= r.response.double_clicked();
+                if !single {
+                    draw_loss_marks(pui, &series, bucket_s, y_min, y_max);
+                }
+                (pui.plot_bounds(), pui.pointer_coordinate())
+            });
+            if r.response.dragged() {
+                dragged_to = Some((r.inner.0.min()[0], r.inner.0.max()[0]));
             }
+            if r.response.hovered() {
+                hover = Some((r.inner.1.map(|p| p.x), r.response.rect.width()));
+            }
+            double_clicked |= r.response.double_clicked();
         }
 
         if let Some(v) = dragged_to {
@@ -328,6 +420,7 @@ impl ViewerApp {
         if double_clicked {
             self.follow = true;
         }
+        self.hover_x = hover.and_then(|h| h.0);
         if let Some((pointer_x, width)) = hover {
             self.handle_wheel(ui, pointer_x, width);
         }
@@ -339,17 +432,14 @@ fn header(ui: &mut egui::Ui, t: &TargetView, visible: &[&Bucket]) {
     let mut medians: Vec<f64> = visible.iter().filter_map(|b| b.pcts.map(|p| p[MEDIAN])).collect();
     medians.sort_by(f64::total_cmp);
     let (count, lost) = visible.iter().fold((0u64, 0u64), |(c, l), b| (c + b.count as u64, l + b.lost as u64));
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&t.row.name).strong().color(t.color));
-        ui.weak(&t.row.host);
-        if !medians.is_empty() {
-            ui.label(format!("median {}", fmt_ms(percentile(&medians, 0.5))));
-        }
-        if count > 0 {
-            let pct = 100.0 * lost as f64 / count as f64;
-            ui.label(RichText::new(format!("loss {pct:.2}%")).color(loss_color(pct / 100.0)));
-        }
-    });
+    ui.label(RichText::new(&t.row.name).strong().color(t.color)).on_hover_text(&t.row.host);
+    if !medians.is_empty() {
+        ui.label(format!("median {}", fmt_ms(percentile(&medians, 0.5))));
+    }
+    if count > 0 {
+        let pct = 100.0 * lost as f64 / count as f64;
+        ui.label(RichText::new(format!("loss {pct:.2}%")).color(loss_color(pct / 100.0)));
+    }
 }
 
 /// Vertical range: a round value above typical medians, so that rare spikes
@@ -383,6 +473,7 @@ fn draw_target(
     buckets: &[Bucket],
     bucket_s: f64,
     smoke: Color32,
+    median: Option<Color32>,
     yv: impl Fn(f64) -> f64,
     name: &str,
 ) {
@@ -423,7 +514,10 @@ fn draw_target(
         let pts: Vec<[f64; 2]> = xs.iter().copied().zip(col(MEDIAN)).map(|(x, y)| [x, y]).collect();
         let starts: Vec<(f64, Color32)> = seg
             .iter()
-            .map(|b| (b.ts_ms as f64 / 1000.0, loss_color(b.lost as f64 / b.count.max(1) as f64)))
+            .map(|b| {
+                let c = median.unwrap_or_else(|| loss_color(b.lost as f64 / b.count.max(1) as f64));
+                (b.ts_ms as f64 / 1000.0, c)
+            })
             .collect();
         let gradient = Arc::new(move |p: PlotPoint| {
             let i = starts.partition_point(|s| s.0 <= p.x).saturating_sub(1);
@@ -439,11 +533,10 @@ fn draw_target(
         if b.pcts.is_none() {
             flush_segment(pui, &segment);
             segment.clear();
-            if gap {
-                if let Some(from) = lost_from.take() {
+            if gap
+                && let Some(from) = lost_from.take() {
                     flush_lost(pui, from, prev_end);
                 }
-            }
             lost_from.get_or_insert(x0);
         } else {
             if let Some(from) = lost_from.take() {
@@ -460,6 +553,51 @@ fn draw_target(
     flush_segment(pui, &segment);
     if let Some(from) = lost_from {
         flush_lost(pui, from, prev_end);
+    }
+}
+
+fn describe_buckets(series: &[(&TargetView, &Vec<Bucket>)], x: f64, bucket_s: f64) -> String {
+    if let [(_, buckets)] = series {
+        return describe_bucket(buckets, x, bucket_s);
+    }
+    let ms = (x * 1000.0) as i64;
+    let mut lines = vec![fmt_time(x, bucket_s)];
+    for (t, buckets) in series {
+        let i = buckets.partition_point(|b| b.ts_ms <= ms).saturating_sub(1);
+        let text = match buckets.get(i).filter(|b| ms < b.ts_ms + (bucket_s * 1000.0) as i64) {
+            None => "no data".to_string(),
+            Some(b) => match b.pcts {
+                None => "all lost".to_string(),
+                Some(p) => format!("{} (10–90%: {} – {}), loss {:.1}%", fmt_ms(p[MEDIAN]), fmt_ms(p[1]), fmt_ms(p[5]), b.loss_pct()),
+            },
+        };
+        lines.push(format!("{}: {text}", t.row.name));
+    }
+    lines.join("\n")
+}
+
+/// Combined chart: packet loss as marks along the bottom, coloured as in SmokePing.
+fn draw_loss_marks(
+    pui: &mut egui_plot::PlotUi<'_>,
+    series: &[(&TargetView, &Vec<Bucket>)],
+    bucket_s: f64,
+    y_min: f64,
+    y_max: f64,
+) {
+    let mut worst: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    for (_, buckets) in series {
+        for b in buckets.iter().filter(|b| b.lost > 0) {
+            let e = worst.entry(b.ts_ms).or_insert(0.0);
+            *e = e.max(b.lost as f64 / b.count.max(1) as f64);
+        }
+    }
+    let h = (y_max - y_min) * 0.04;
+    for (ts, loss) in worst {
+        let (a, b) = (ts as f64 / 1000.0, ts as f64 / 1000.0 + bucket_s);
+        let pts = PlotPoints::from(vec![[a, y_min], [b, y_min], [b, y_min + h], [a, y_min + h]]);
+        pui.polygon(
+            egui_plot::Polygon::new("loss", pts).fill_color(loss_color(loss)).stroke(egui::Stroke::NONE).allow_hover(false),
+        );
     }
 }
 
@@ -497,8 +635,14 @@ fn fmt_ms(ms: f64) -> String {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.snapshot_step(ui);
-        while let Ok(a) = self.ans_rx.try_recv() {
-            self.loaded = Some(a);
+        while let Ok(msg) = self.ans_rx.try_recv() {
+            match msg {
+                Msg::Data(a) => {
+                    self.has_fixes |= !a.fixes.is_empty();
+                    self.loaded = Some(a);
+                }
+                Msg::Modes(s) => self.segments = s,
+            }
         }
         if self.follow {
             let now = now_ms() as f64 / 1000.0;
@@ -522,7 +666,8 @@ impl eframe::App for ViewerApp {
                     fmt_duration(bucket)
                 ));
                 ui.separator();
-                ui.weak("median colour = loss:");
+                let single = self.split || self.targets.iter().filter(|t| t.shown).count() == 1;
+                ui.weak(if single { "median colour = loss:" } else { "loss marks:" });
                 for (label, loss) in [("0", 0.0), ("<5%", 0.01), ("<10%", 0.07), ("<20%", 0.15), ("<50%", 0.3), ("more", 0.6)] {
                     ui.label(RichText::new(format!("■ {label}")).color(loss_color(loss)));
                 }
@@ -531,6 +676,14 @@ impl eframe::App for ViewerApp {
                 });
             });
         });
+        if self.map.is_some() {
+            let width = ui.available_width();
+            egui::Panel::right("map")
+                .resizable(true)
+                .default_size(width * 0.42)
+                .size_range(240.0..=width * 0.8)
+                .show(ui, |ui| self.map_panel(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| self.plots(ui));
 
         if self.follow {
@@ -673,4 +826,61 @@ fn value_grid(input: GridInput) -> Vec<GridMark> {
         }
     }
     marks
+}
+
+impl ViewerApp {
+    /// Connection quality at a time, over the shown targets: loss colour when
+    /// pings were lost, else latency colour.
+    fn quality_at(&self, ts_ms: i64) -> Option<Color32> {
+        let answer = self.loaded.as_ref()?;
+        let bucket_ms = answer.query.bucket_ms;
+        let mut worst_loss: f64 = 0.0;
+        let mut worst_median: Option<f64> = None;
+        let mut any = false;
+        for t in self.targets.iter().filter(|t| t.shown) {
+            let Some(buckets) = answer.data.get(&t.row.id) else { continue };
+            let i = buckets.partition_point(|b| b.ts_ms <= ts_ms).saturating_sub(1);
+            let Some(b) = buckets.get(i).filter(|b| ts_ms < b.ts_ms + bucket_ms) else { continue };
+            any = true;
+            worst_loss = worst_loss.max(b.lost as f64 / b.count.max(1) as f64);
+            if let Some(p) = b.pcts {
+                worst_median = Some(worst_median.map_or(p[MEDIAN], |m: f64| m.max(p[MEDIAN])));
+            }
+        }
+        if !any {
+            return None;
+        }
+        Some(if worst_loss > 0.0 {
+            loss_color(worst_loss)
+        } else {
+            match worst_median {
+                Some(m) if m >= self.thresholds.bad_ms => Color32::from_rgb(0xff, 0x78, 0x00),
+                Some(m) if m >= self.thresholds.warn_ms => Color32::from_rgb(0xf6, 0xd3, 0x2d),
+                _ => loss_color(0.0),
+            }
+        })
+    }
+
+    fn map_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(mut map) = self.map.take() else { return };
+        let empty = Vec::new();
+        let fixes = self.loaded.as_ref().map_or(&empty, |a| &a.fixes);
+        let quality = |ts: i64| self.quality_at(ts);
+        let input = MapInput {
+            fixes,
+            view: self.view,
+            hover: self.hover_x,
+            segments: &self.segments,
+            quality: &quality,
+            max_gap_ms: self.max_gap_ms,
+        };
+        let clicked = map.ui(ui, &input);
+        self.map = Some(map);
+        if let Some(t) = clicked {
+            // centre the charts on the clicked moment
+            let half = self.span() / 2.0;
+            self.view = (t - half, t + half);
+            self.follow = false;
+        }
+    }
 }

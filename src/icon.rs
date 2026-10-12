@@ -120,8 +120,8 @@ impl Canvas {
         if out_a == 0 {
             return;
         }
-        for k in 0..3 {
-            let s = rgb[k] as u32 * sa;
+        for (k, &c) in rgb.iter().enumerate() {
+            let s = c as u32 * sa;
             let d = self.px[i + k] as u32 * da * (255 - sa) / 255;
             self.px[i + k] = ((s + d) / out_a) as u8;
         }

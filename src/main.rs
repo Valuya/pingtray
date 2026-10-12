@@ -1,8 +1,11 @@
 mod collector;
 mod config;
 mod icon;
+mod location;
+mod map;
 mod pinger;
 mod store;
+mod transport;
 mod tray;
 mod viewer;
 
@@ -31,6 +34,10 @@ enum Command {
     Collect,
     /// Open the graph window.
     View,
+    /// Import positions from GPX, CSV, OwnTracks .rec or JSON files.
+    Import {
+        files: Vec<PathBuf>,
+    },
     /// Start pingtray with the desktop session (XDG autostart).
     Autostart {
         /// Remove the autostart entry instead.
@@ -104,5 +111,9 @@ fn main() -> Result<()> {
             viewer::run(cfg)
         }
         Command::Autostart { remove } => autostart(remove, &config_path),
+        Command::Import { files } => {
+            let mut store = store::Store::open(&config::db_path())?;
+            location::import_files(&mut store, &files)
+        }
     }
 }

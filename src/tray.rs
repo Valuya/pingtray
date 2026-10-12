@@ -3,6 +3,8 @@
 //! for Windows/macOS) without touching the rest.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// What the tray shows; rebuilt by the collector.
 #[derive(Clone, Default)]
@@ -14,6 +16,37 @@ pub struct TrayState {
     pub pixmap: (usize, usize, Vec<u8>),
     pub tooltip: String,
     pub config_path: PathBuf,
+    /// Target names, for the "Tray graph" menu.
+    pub choices: Vec<String>,
+    /// Shared with the collector: 0 = all targets pooled, i + 1 = target i.
+    pub selection: Arc<AtomicUsize>,
+}
+
+pub fn selected_target(selection: &AtomicUsize) -> Option<usize> {
+    selection.load(Ordering::Relaxed).checked_sub(1)
+}
+
+fn selection_file() -> PathBuf {
+    crate::config::data_dir().join("tray_target")
+}
+
+/// Last choice made in the menu, else the config's `tray_target`, else the first target.
+pub fn load_selection(choices: &[String], configured: Option<&str>) -> Arc<AtomicUsize> {
+    let saved = std::fs::read_to_string(selection_file()).ok();
+    let wanted = saved.as_deref().map(str::trim).or(configured);
+    let value = match wanted {
+        Some("all") => 0,
+        Some(name) => choices.iter().position(|c| c == name).map_or(1, |i| i + 1),
+        None => 1,
+    };
+    Arc::new(AtomicUsize::new(value))
+}
+
+fn save_selection(choices: &[String], value: usize) {
+    let name = value.checked_sub(1).and_then(|i| choices.get(i)).map_or("all", String::as_str);
+    if let Err(e) = std::fs::write(selection_file(), name) {
+        tracing::warn!("saving tray target: {e}");
+    }
 }
 
 /// Opens the big graph window in a separate process, so the tray stays light.
@@ -85,11 +118,33 @@ mod sni {
             open_viewer(&self.0.config_path);
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-            use ksni::menu::StandardItem;
+            use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
+            let n = self.0.choices.len();
+            let selected = selected_target(&self.0.selection).unwrap_or(n);
+            let mut options: Vec<RadioItem> =
+                self.0.choices.iter().map(|c| RadioItem { label: c.clone(), ..Default::default() }).collect();
+            options.push(RadioItem { label: "All targets".into(), ..Default::default() });
             vec![
                 StandardItem {
                     label: "Show graph".into(),
                     activate: Box::new(|t: &mut Self| open_viewer(&t.0.config_path)),
+                    ..Default::default()
+                }
+                .into(),
+                SubMenu {
+                    label: "Tray graph".into(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected,
+                            select: Box::new(|t: &mut Self, i: usize| {
+                                let value = if i < t.0.choices.len() { i + 1 } else { 0 };
+                                t.0.selection.store(value, Ordering::Relaxed);
+                                save_selection(&t.0.choices, value);
+                            }),
+                            options,
+                        }
+                        .into(),
+                    ],
                     ..Default::default()
                 }
                 .into(),

@@ -48,23 +48,27 @@ impl Live {
         }
     }
 
-    fn pooled(&self, from_ms: i64, to_ms: i64) -> Vec<Option<f64>> {
+    /// Samples of one target (`Some(index)`) or of all of them, in a time range.
+    fn pooled(&self, which: Option<usize>, from_ms: i64, to_ms: i64) -> Vec<Option<f64>> {
         self.recent
             .iter()
+            .enumerate()
+            .filter(|(i, _)| which.is_none_or(|w| w == *i))
+            .map(|(_, q)| q)
             .flat_map(|q| q.iter().filter(|(ts, _)| *ts >= from_ms && *ts < to_ms).map(|(_, v)| *v))
             .collect()
     }
 
-    fn icon_data(&self, now_ms: i64) -> IconData {
+    fn icon_data(&self, now_ms: i64, which: Option<usize>) -> IconData {
         // columns aligned on wall-clock slices, the last one still filling
         let end = (now_ms / self.column_ms + 1) * self.column_ms;
         let columns = (0..self.columns)
             .map(|i| {
                 let from = end - (self.columns - i) as i64 * self.column_ms;
-                Column::from_samples(&self.pooled(from, from + self.column_ms))
+                Column::from_samples(&self.pooled(which, from, from + self.column_ms))
             })
             .collect();
-        let latest = Column::from_samples(&self.pooled(now_ms - self.current_ms, now_ms + 1));
+        let latest = Column::from_samples(&self.pooled(which, now_ms - self.current_ms, now_ms + 1));
         let current = match latest.pcts {
             Some(p) => Current::Ms(p[2]),
             None if latest.count > 0 => Current::Lost,
@@ -73,12 +77,13 @@ impl Live {
         IconData { current, columns }
     }
 
-    fn tooltip(&self, cfg: &Config) -> String {
+    fn tooltip(&self, cfg: &Config, which: Option<usize>) -> String {
         let mut lines: Vec<String> = self
             .names
             .iter()
             .zip(&self.recent)
-            .map(|(name, q)| {
+            .enumerate()
+            .map(|(i, (name, q))| {
                 let last = match q.back() {
                     None => "…".to_string(),
                     Some((_, None)) => "lost".to_string(),
@@ -86,17 +91,19 @@ impl Live {
                 };
                 let lost = q.iter().filter(|(_, v)| v.is_none()).count();
                 let loss = if q.is_empty() { 0.0 } else { 100.0 * lost as f64 / q.len() as f64 };
-                format!("{name}: {last}, loss {loss:.0}% over 5 min")
+                let mark = if which.is_none_or(|w| w == i) { "▸ " } else { "   " };
+                format!("{mark}{name}: {last}, loss {loss:.0}% over 5 min")
             })
             .collect();
         lines.push(String::new());
         lines.push(format!(
-            "Number: median ms right now. Graph: last {} min, one column per {} s, top = {} ms,\n\
+            "{}Number: median ms right now. Graph: last {} min, one column per {} s, top = {} ms,\n\
              grey = spread, tick = median, tick colour = loss \
              (green 0, cyan/blue a little, purple, orange, red heavy).",
+            if which.is_none() { "All targets pooled (▸). " } else { "" },
             (self.columns as f64 * cfg.icon_column_secs / 60.0).round(),
             cfg.icon_column_secs,
-            icon::ceiling_ms(&self.icon_data(crate::pinger::now_ms()).columns)
+            icon::ceiling_ms(&self.icon_data(crate::pinger::now_ms(), which).columns)
         ));
         lines.join("\n")
     }
@@ -117,7 +124,8 @@ impl TrayFeed {
             return;
         }
         self.last = Some(Instant::now());
-        let data = live.icon_data(pinger::now_ms());
+        let which = crate::tray::selected_target(&self.base.selection);
+        let data = live.icon_data(pinger::now_ms(), which);
         let (w, h, rgba) = icon::render(&data, self.height, self.thresholds);
         let icon_file = self.sink.as_mut().and_then(|s| {
             s.write(w, h, &rgba).map_err(|e| tracing::warn!("writing icon: {e}")).ok()
@@ -125,10 +133,28 @@ impl TrayFeed {
         let state = TrayState {
             icon_file,
             pixmap: (w, h, icon::rgba_to_argb(rgba)),
-            tooltip: live.tooltip(cfg),
+            tooltip: live.tooltip(cfg, which),
             ..self.base.clone()
         };
         self.handle.update(state).await;
+    }
+}
+
+/// Phone positions: HTTP endpoint and watched folder, when configured.
+fn start_location_inputs(cfg: &Config) {
+    let loc = &cfg.location;
+    if let Some(listen) = &loc.listen {
+        let started = listen
+            .parse()
+            .map_err(anyhow::Error::from)
+            .and_then(|addr| crate::location::spawn_server(addr, loc.token.clone(), config::db_path()));
+        if let Err(e) = started {
+            tracing::error!("location endpoint: {e}");
+        }
+    }
+    if let Some(dir) = loc.watch_dir() {
+        tracing::info!("watching {} for position files", dir.display());
+        crate::location::spawn_dir_watcher(dir, config::db_path());
     }
 }
 
@@ -144,6 +170,8 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
         .map(|t| store.upsert_target(&t.name, &t.host))
         .collect::<Result<Vec<_>>>()?;
 
+    start_location_inputs(&cfg);
+
     let (tx, mut rx) = mpsc::channel::<Sample>(256);
     pinger::spawn_all(cfg.clone(), tx)?;
 
@@ -157,7 +185,15 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
     }
     let mut tray = None;
     if with_tray {
-        let base = TrayState { tooltip: "starting…".into(), config_path: config_path.clone(), ..Default::default() };
+        let choices: Vec<String> = cfg.targets.iter().map(|t| t.name.clone()).collect();
+        let selection = crate::tray::load_selection(&choices, cfg.tray_target.as_deref());
+        let base = TrayState {
+            tooltip: "starting…".into(),
+            config_path: config_path.clone(),
+            choices,
+            selection,
+            ..Default::default()
+        };
         if let Some(handle) = TrayHandle::spawn(base.clone()).await {
             let sink = PngSink::new(&config::runtime_dir().join("icons"))
                 .map_err(|e| tracing::warn!("icon directory: {e}"))
@@ -218,7 +254,7 @@ mod tests {
         for (target, ts_ms, rtt) in [(0, 1_000, ms(10)), (1, 1_000, None), (0, 12_000, ms(20)), (1, 12_000, ms(40))] {
             live.push(&Sample { target, ts_ms, rtt });
         }
-        let d = live.icon_data(13_000);
+        let d = live.icon_data(13_000, None);
         assert_eq!(d.columns[0].loss, 0.5);
         assert_eq!(d.columns[1].pcts.unwrap()[2], 30.0);
         assert_eq!(d.current, Current::Ms(30.0));

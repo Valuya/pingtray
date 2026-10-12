@@ -24,6 +24,13 @@ icon_columns = 20
 icon_column_secs = 15.0
 icon_height = 20
 
+# Positions from your phone (see README). Uncomment to enable.
+# [location]
+# listen = "0.0.0.0:8765"
+# token = "pick-a-long-random-string"
+# watch_dir = "~/Sync/gpslogger"
+# max_gap_secs = 600
+
 [[target]]
 name = "Google DNS"
 host = "8.8.8.8"
@@ -44,8 +51,12 @@ pub struct Config {
     pub icon_columns: usize,
     pub icon_column_secs: f64,
     pub icon_height: usize,
+    /// Target shown in the tray graph (name), or "all"; changeable from the
+    /// icon's menu, which then takes precedence.
+    pub tray_target: Option<String>,
     #[serde(rename = "target")]
     pub targets: Vec<Target>,
+    pub location: LocationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -67,7 +78,9 @@ impl Default for Config {
             icon_columns: 20,
             icon_column_secs: 15.0,
             icon_height: 20,
+            tray_target: None,
             targets: Vec::new(),
+            location: LocationConfig::default(),
         }
     }
 }
@@ -117,11 +130,45 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
+/// `PINGTRAY_DB` overrides it (tests, demos).
 pub fn db_path() -> PathBuf {
-    data_dir().join("pingtray.sqlite")
+    std::env::var_os("PINGTRAY_DB").map(PathBuf::from).unwrap_or_else(|| data_dir().join("pingtray.sqlite"))
 }
 
 /// Per-session scratch space (icons); falls back to the data dir.
 pub fn runtime_dir() -> PathBuf {
     dirs().runtime_dir().map(Path::to_path_buf).unwrap_or_else(data_dir)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LocationConfig {
+    /// Address for the phone to post positions to, e.g. "0.0.0.0:8765".
+    pub listen: Option<String>,
+    /// Shared secret: `?token=…` or HTTP Basic password. Required unless loopback.
+    pub token: Option<String>,
+    /// Folder scanned every minute for GPX / CSV / OwnTracks files.
+    pub watch_dir: Option<PathBuf>,
+    /// A ping farther than this from any position gets none.
+    pub max_gap_secs: f64,
+}
+
+impl Default for LocationConfig {
+    fn default() -> Self {
+        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0 }
+    }
+}
+
+impl LocationConfig {
+    pub fn max_gap_ms(&self) -> i64 {
+        (self.max_gap_secs * 1000.0) as i64
+    }
+
+    pub fn watch_dir(&self) -> Option<PathBuf> {
+        let dir = self.watch_dir.as_ref()?;
+        match dir.strip_prefix("~") {
+            Ok(rest) => directories::BaseDirs::new().map(|b| b.home_dir().join(rest)),
+            Err(_) => Some(dir.clone()),
+        }
+    }
 }
