@@ -1,7 +1,6 @@
-//! SmokePing's "smoke" as a true gradient: a mesh whose opacity follows the
-//! distribution of reply times (densest at the median, fading to nothing at
-//! the extremes), interpolated between neighbouring points, so that there
-//! are no hard edges in either direction.
+//! SmokePing's "smoke" as a true gradient: for each time slot, a column whose
+//! opacity follows the distribution of reply times (densest at the median,
+//! fading to nothing at the extremes).
 
 use std::ops::RangeInclusive;
 
@@ -38,38 +37,26 @@ fn alpha_at(q: f64, max_alpha: f32) -> f32 {
 impl PlotItem for Smoke {
     fn shapes(&self, _ui: &Ui, transform: &PlotTransform, shapes: &mut Vec<Shape>) {
         let colors: Vec<Color32> = PCTS.iter().map(|&q| self.color.gamma_multiply(alpha_at(q, self.max_alpha))).collect();
-        for run in &self.runs {
-            if run.is_empty() {
-                continue;
-            }
-            // stations: the first and last columns reach their bucket edges,
-            // inner ones meet at their centres
-            let mut xs: Vec<(f64, &[f64; PCTS.len()])> = Vec::with_capacity(run.len() + 2);
-            xs.push((run[0].0 - self.half_width, &run[0].1));
-            for (x, ys) in run {
-                xs.push((*x, ys));
-            }
-            let last = run.last().expect("non-empty");
-            xs.push((last.0 + self.half_width, &last.1));
-
-            let mut mesh = Mesh::default();
-            let pos = |x: f64, y: f64| -> Pos2 { transform.position_from_point(&PlotPoint::new(x, y)) };
-            for (x, ys) in &xs {
+        let mut mesh = Mesh::default();
+        let pos = |x: f64, y: f64| -> Pos2 { transform.position_from_point(&PlotPoint::new(x, y)) };
+        let n = PCTS.len() as u32;
+        // SmokePing style: each point is an interval, its own column with a
+        // vertical gradient; neighbours are not blended
+        for (x, ys) in self.runs.iter().flatten() {
+            let base = mesh.vertices.len() as u32;
+            for edge in [x - self.half_width, x + self.half_width] {
                 for (k, y) in ys.iter().enumerate() {
-                    mesh.colored_vertex(pos(*x, *y), colors[k]);
+                    mesh.colored_vertex(pos(edge, *y), colors[k]);
                 }
             }
-            let n = PCTS.len() as u32;
-            for c in 0..xs.len() as u32 - 1 {
-                for k in 0..n - 1 {
-                    let (a, b) = (c * n + k, c * n + k + 1);
-                    let (d, e) = ((c + 1) * n + k, (c + 1) * n + k + 1);
-                    mesh.add_triangle(a, b, e);
-                    mesh.add_triangle(a, e, d);
-                }
+            for k in 0..n - 1 {
+                let (a, b) = (base + k, base + k + 1);
+                let (d, e) = (base + n + k, base + n + k + 1);
+                mesh.add_triangle(a, b, e);
+                mesh.add_triangle(a, e, d);
             }
-            shapes.push(Shape::mesh(mesh));
         }
+        shapes.push(Shape::mesh(mesh));
     }
 
     fn initialize(&mut self, _x_range: RangeInclusive<f64>) {}

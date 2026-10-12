@@ -109,7 +109,9 @@ mod sni {
         }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
             let (w, h, data) = &self.0.pixmap;
-            if data.is_empty() {
+            // with a file, no pixmap: GNOME's extension would draw it after the
+            // wide file image, squeezed into a square
+            if data.is_empty() || self.0.icon_file.is_some() {
                 return Vec::new();
             }
             vec![ksni::Icon { width: *w as i32, height: *h as i32, data: data.clone() }]
@@ -250,7 +252,9 @@ mod power_sni {
         }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
             let (w, h, data) = &self.0.pixmap;
-            if data.is_empty() {
+            // with a file, no pixmap: GNOME's extension would draw it after the
+            // wide file image, squeezed into a square
+            if data.is_empty() || self.0.icon_file.is_some() {
                 return Vec::new();
             }
             vec![ksni::Icon { width: *w as i32, height: *h as i32, data: data.clone() }]

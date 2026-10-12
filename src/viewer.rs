@@ -41,7 +41,7 @@ const MIN_SPAN: f64 = 30.0;
 const MAX_SPAN: f64 = 400.0 * 86_400.0;
 
 /// Window toggles, remembered between openings.
-#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Prefs {
     log_y: bool,
@@ -49,13 +49,14 @@ struct Prefs {
     loss_colours: bool,
     show_ping: bool,
     show_http: bool,
+    reference: Option<String>,
     map: bool,
     color_by: ColorBy,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { log_y: false, split: false, loss_colours: false, show_ping: true, show_http: true, map: true, color_by: ColorBy::Quality }
+        Prefs { log_y: false, split: false, loss_colours: false, show_ping: true, show_http: true, reference: None, map: true, color_by: ColorBy::Quality }
     }
 }
 
@@ -95,6 +96,11 @@ impl Series<'_> {
 
     fn label(&self) -> String {
         format!("{} {}", self.t.row.name, if self.http { "HTTP" } else { "ping" })
+    }
+
+    /// Stable name for preferences: "name|ping" or "name|http".
+    fn key(&self) -> String {
+        format!("{}|{}", self.t.row.name, if self.http { "http" } else { "ping" })
     }
 }
 
@@ -146,6 +152,8 @@ pub struct ViewerApp {
     hover_x: Option<f64>,
     /// Series nearest to the mouse: drawn thicker, the others dimmed.
     highlight: Option<i64>,
+    /// The series drawn in full (smoke, loss): "name|ping" or "name|http".
+    reference: Option<String>,
     sent: Option<Query>,
     sent_at: Instant,
     req_tx: mpsc::Sender<Query>,
@@ -266,7 +274,7 @@ impl ViewerApp {
             targets,
             first_sample_s,
             // PINGTRAY_SPAN (seconds): initial range, a debug aid for snapshots
-            view: (now - std::env::var("PINGTRAY_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(3600.0), now),
+            view: (now - std::env::var("PINGTRAY_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(900.0), now),
             follow: true,
             log_y: prefs.log_y,
             split: prefs.split,
@@ -277,9 +285,10 @@ impl ViewerApp {
             segments: Vec::new(),
             has_fixes,
             map: (prefs.map && has_fixes).then(|| MapView::new(&cc.egui_ctx, prefs.color_by)),
-            saved_prefs: prefs,
+            saved_prefs: prefs.clone(),
             hover_x: None,
             highlight: None,
+            reference: prefs.reference.clone(),
             sent: None,
             sent_at: Instant::now(),
             req_tx,
@@ -378,6 +387,35 @@ impl ViewerApp {
                 let label = RichText::new(&t.row.name).color(t.color).strong();
                 ui.checkbox(&mut t.shown, label).on_hover_text(&t.row.host);
             }
+            ui.separator();
+            // the series drawn in full (smoke, loss); also: click a curve
+            let choices: Vec<(String, String)> = self
+                .targets
+                .iter()
+                .filter(|t| t.shown)
+                .flat_map(|t| {
+                    let ping = self.show_ping.then(|| (format!("{}|ping", t.row.name), format!("{} ping", t.row.name)));
+                    let http = (self.show_http && t.http.is_some())
+                        .then(|| (format!("{}|http", t.row.name), format!("{} HTTP", t.row.name)));
+                    ping.into_iter().chain(http)
+                })
+                .collect();
+            let current = self
+                .reference
+                .as_ref()
+                .and_then(|r| choices.iter().find(|c| &c.0 == r))
+                .map(|c| c.1.clone())
+                .unwrap_or_else(|| choices.first().map(|c| c.1.clone()).unwrap_or_default());
+            ui.label("Reference");
+            egui::ComboBox::from_id_salt("reference").selected_text(current).show_ui(ui, |ui| {
+                for (key, label) in &choices {
+                    if ui.selectable_label(self.reference.as_ref() == Some(key), label).clicked() {
+                        self.reference = Some(key.clone());
+                    }
+                }
+            })
+            .response
+            .on_hover_text("The series drawn with smoke and loss; the others are faint. Clicking a curve picks it too.");
         });
     }
 
@@ -433,6 +471,7 @@ impl ViewerApp {
         let mut double_clicked = false;
         let highlight = self.highlight;
         let mut new_highlight = None;
+        let mut new_reference = None;
 
         if !self.segments.is_empty() {
             crate::map::mode_strip(ui, &self.segments, view, 48.0);
@@ -460,11 +499,24 @@ impl ViewerApp {
                     ui.add_space(14.0);
                 }
             });
-            let per_series: Vec<Vec<&Bucket>> =
-                series.iter().map(|s| s.buckets.iter().filter(in_view).collect()).collect();
-            let (y_min, y_max) = y_range(&per_series, log_y);
-            let to_ms = move |y: f64| if log_y { 10f64.powf(y) } else { y };
-            let yv = move |ms: f64| if log_y { ms.max(0.1).log10() } else { ms };
+            // the reference: the chosen series if in this chart, else its first ping
+            let reference = series
+                .iter()
+                .position(|s| self.reference.as_deref() == Some(s.key().as_str()))
+                .or_else(|| series.iter().position(|s| !s.http))
+                .unwrap_or(0);
+            let reference_id = series.get(reference).map(|s| s.id());
+            // ping on the left axis, HTTP on its own scale on the right
+            let visible_of = |http: bool| -> Vec<Vec<&Bucket>> {
+                series.iter().filter(|s| s.http == http).map(|s| s.buckets.iter().filter(in_view).collect()).collect()
+            };
+            let (pings, https) = (visible_of(false), visible_of(true));
+            let scale = Scale::new(
+                (!pings.is_empty()).then(|| y_range(&pings, log_y)),
+                (!https.is_empty()).then(|| y_range(&https, log_y)),
+                log_y,
+            );
+            let (y_min, y_max) = scale.bounds();
             let last = i + 1 == n;
             // with several targets on one chart, loss colours would be ambiguous
             let loss_colours = self.loss_colours && series.len() == 1;
@@ -477,9 +529,8 @@ impl ViewerApp {
                 .show_axes([last, true])
                 .x_grid_spacer(time_grid)
                 .x_axis_formatter(|m, _| fmt_axis(m))
-                .y_axis_formatter(move |m, _| fmt_ms(to_ms(m.value)))
+                .custom_y_axes(scale.axes())
                 .y_grid_spacer(value_grid)
-                .y_axis_min_width(48.0)
                 // our own tooltip below, richer than the plot's text label
                 .show_x(false)
                 .show_y(false)
@@ -490,20 +541,25 @@ impl ViewerApp {
                 }
                 pui.set_auto_bounds([false, false]);
                 pui.set_plot_bounds_y(y_min..=y_max);
-                for s in &series {
-                    // each target in its own colour, loss marked along the bottom;
-                    // or SmokePing's own look: grey smoke, median coloured by loss.
-                    // HTTP: same colour, lighter smoke, dashed median.
-                    let (smoke, median) = if loss_colours { (grey, None) } else { (s.t.color, Some(s.t.color)) };
+                // the others first, faint; the reference last, in full
+                let order = (0..series.len()).filter(|&k| k != reference).chain(std::iter::once(reference));
+                for k in order {
+                    let Some(s) = series.get(k) else { continue };
+                    let is_reference = k == reference;
+                    // each target in its own colour, or SmokePing's own look:
+                    // grey smoke, median coloured by loss
+                    let (smoke, median) =
+                        if loss_colours && is_reference { (grey, None) } else { (s.t.color, Some(s.t.color)) };
                     let emphasis = match highlight {
-                        None => Emphasis::Normal,
                         Some(id) if id == s.id() => Emphasis::Highlight,
-                        Some(_) => Emphasis::Dim,
+                        _ if is_reference => Emphasis::Normal,
+                        _ => Emphasis::Dim,
                     };
-                    draw_target(pui, s.buckets, bucket_s, smoke, median, yv, &s.label(), s.http, emphasis);
+                    let http = s.http;
+                    draw_target(pui, s.buckets, bucket_s, smoke, median, |ms| scale.y(ms, http), &s.label(), http, emphasis, is_reference);
                 }
-                if !loss_colours {
-                    draw_loss_marks(pui, &series, bucket_s, y_min, y_max);
+                if !loss_colours && let Some(s) = series.get(reference) {
+                    draw_loss_marks(pui, std::slice::from_ref(s), bucket_s, y_min, y_max);
                 }
                 (pui.plot_bounds(), pui.pointer_coordinate())
             });
@@ -520,7 +576,7 @@ impl ViewerApp {
                     let y = series
                         .iter()
                         .filter_map(|s| bucket_at(s.buckets, (x * 1000.0) as i64, answer.query.bucket_ms)?.pcts)
-                        .map(|p| yv(p[MEDIAN]))
+                        .map(|p| scale.y(p[MEDIAN], false))
                         .fold(f64::NEG_INFINITY, f64::max);
                     y.is_finite().then(|| PlotPoint::new(x, y))
                 });
@@ -536,7 +592,7 @@ impl ViewerApp {
                         .iter()
                         .filter_map(|s| {
                             let b = bucket_at(s.buckets, (p.x * 1000.0) as i64, bucket_ms)?;
-                            let y = r.transform.position_from_point_y(yv(b.pcts?[MEDIAN]));
+                            let y = r.transform.position_from_point_y(scale.y(b.pcts?[MEDIAN], s.http));
                             Some(((y - pointer_y).abs(), s.id()))
                         })
                         .filter(|(d, _)| *d < 30.0)
@@ -544,7 +600,7 @@ impl ViewerApp {
                         .map(|(_, id)| id);
                     let place = describe_place(&answer.fixes, &self.segments, p.x, self.max_gap_ms);
                     let show = |ui: &mut egui::Ui| {
-                        tooltip_ui(ui, p.x, bucket_ms, &series, new_highlight, place.as_deref());
+                        tooltip_ui(ui, p.x, bucket_ms, &series, new_highlight, reference_id, place.as_deref());
                     };
                     if fake.is_some() {
                         let at = r.transform.position_from_point(&p);
@@ -557,6 +613,16 @@ impl ViewerApp {
                 }
             }
             double_clicked |= r.response.double_clicked();
+            // clicking a curve makes it the reference
+            if r.response.clicked()
+                && let Some(id) = new_highlight
+                && let Some(s) = series.iter().find(|s| s.id() == id)
+            {
+                new_reference = Some(s.key());
+            }
+        }
+        if let Some(key) = new_reference {
+            self.reference = Some(key);
         }
         if new_highlight != self.highlight {
             self.highlight = new_highlight;
@@ -652,8 +718,10 @@ enum Emphasis {
     Dim,
 }
 
-/// SmokePing drawing for one series: smoke as a gradient for the spread, the
-/// median as a line, red shading where everything was lost.
+/// SmokePing drawing for one series. The reference gets smoke (a vertical
+/// gradient per time slot), a median line and red shading where everything
+/// was lost; the others only a faint median line. Each point is drawn as an
+/// interval: a step across its time slot.
 #[allow(clippy::too_many_arguments)]
 fn draw_target(
     pui: &mut egui_plot::PlotUi<'_>,
@@ -665,16 +733,18 @@ fn draw_target(
     name: &str,
     http: bool,
     emphasis: Emphasis,
+    reference: bool,
 ) {
-    let dim = if emphasis == Emphasis::Dim { 0.35 } else { 1.0 };
-    // HTTP: lighter smoke, so that pings stay readable underneath
-    let max_alpha = if http { 0.22 } else { 0.42 } * dim;
-    let width = match emphasis {
-        Emphasis::Highlight => 3.5,
-        Emphasis::Normal => 2.0,
-        Emphasis::Dim => 1.5,
+    let fade = match emphasis {
+        Emphasis::Dim => 0.45,
+        _ => 1.0,
     };
-    let centre = |b: &Bucket| b.ts_ms as f64 / 1000.0 + bucket_s / 2.0;
+    let width: f32 = match emphasis {
+        Emphasis::Highlight => 3.0,
+        Emphasis::Normal => 2.0,
+        Emphasis::Dim => 1.2,
+    };
+    let edge = bucket_s * 0.001;
 
     // runs of buckets with replies, cut where data is missing or all lost
     let mut runs: Vec<Vec<&Bucket>> = Vec::new();
@@ -696,37 +766,120 @@ fn draw_target(
         prev = Some(b);
     }
 
-    let columns: Vec<Vec<crate::smoke::Column>> = runs
-        .iter()
-        .map(|run| run.iter().map(|b| (centre(b), b.pcts.expect("replies").map(&yv))).collect())
-        .collect();
-    pui.add(crate::smoke::Smoke::new(name, columns, bucket_s, smoke, max_alpha));
+    if reference {
+        let columns: Vec<Vec<crate::smoke::Column>> = runs
+            .iter()
+            .map(|run| {
+                run.iter().map(|b| (b.ts_ms as f64 / 1000.0 + bucket_s / 2.0, b.pcts.expect("replies").map(&yv))).collect()
+            })
+            .collect();
+        let max_alpha = if http { 0.3 } else { 0.45 };
+        pui.add(crate::smoke::Smoke::new(name, columns, bucket_s, smoke, max_alpha * fade));
+        for (from, to) in &lost {
+            pui.add(Span::new("lost", *from..=*to).fill(loss_color(1.0).gamma_multiply(0.25)).border_width(0.0));
+        }
+    }
 
+    let alpha = if reference { 1.0 } else { 0.55 * fade };
     for run in &runs {
-        let mut pts: Vec<[f64; 2]> = run.iter().map(|b| [centre(b), yv(b.pcts.expect("replies")[MEDIAN])]).collect();
-        if let [only] = pts[..] {
-            // a lone point: a short flat dash across its bucket
-            pts = vec![[only[0] - bucket_s / 2.0, only[1]], [only[0] + bucket_s / 2.0, only[1]]];
+        // steps: flat across each time slot
+        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(run.len() * 2);
+        for b in run {
+            let (x0, y) = (b.ts_ms as f64 / 1000.0, yv(b.pcts.expect("replies")[MEDIAN]));
+            pts.push([x0 + edge, y]);
+            pts.push([x0 + bucket_s - edge, y]);
         }
         let colours: Vec<(f64, Color32)> = run
             .iter()
             .map(|b| {
                 let c = median.unwrap_or_else(|| loss_color(b.lost as f64 / b.count.max(1) as f64));
-                (b.ts_ms as f64 / 1000.0, c.gamma_multiply(dim))
+                (b.ts_ms as f64 / 1000.0, c.gamma_multiply(alpha))
             })
             .collect();
         let gradient = Arc::new(move |p: PlotPoint| {
             let i = colours.partition_point(|s| s.0 <= p.x).saturating_sub(1);
             colours.get(i).map(|s| s.1).unwrap_or(Color32::GRAY)
         });
-        let mut line = Line::new(name, PlotPoints::from(pts)).gradient_color(gradient, false).width(width);
+        let w = if reference { width } else { width.min(1.4) };
+        let mut line = Line::new(name, PlotPoints::from(pts)).gradient_color(gradient, false).width(w);
         if http {
             line = line.style(egui_plot::LineStyle::dashed_dense());
         }
         pui.line(line);
     }
-    for (from, to) in lost {
-        pui.add(Span::new("lost", from..=to).fill(loss_color(1.0).gamma_multiply(0.25 * dim)).border_width(0.0));
+}
+
+/// Ping on the left axis; HTTP mapped onto the same plot from its own range,
+/// labelled on the right axis.
+#[derive(Clone, Copy)]
+struct Scale {
+    log: bool,
+    /// Plot range (in axis units: ms, or log10 ms).
+    main: (f64, f64),
+    /// HTTP range when it has its own axis.
+    http: Option<(f64, f64)>,
+    /// Which kind the main (left) axis shows.
+    main_is_http: bool,
+}
+
+impl Scale {
+    fn new(ping: Option<(f64, f64)>, http: Option<(f64, f64)>, log: bool) -> Scale {
+        match (ping, http) {
+            (Some(p), Some(h)) => Scale { log, main: p, http: Some(h), main_is_http: false },
+            (Some(p), None) => Scale { log, main: p, http: None, main_is_http: false },
+            (None, Some(h)) => Scale { log, main: h, http: None, main_is_http: true },
+            (None, None) => Scale { log, main: (0.0, 50.0), http: None, main_is_http: false },
+        }
+    }
+
+    fn bounds(&self) -> (f64, f64) {
+        self.main
+    }
+
+    fn units(&self, ms: f64) -> f64 {
+        if self.log { ms.max(0.1).log10() } else { ms }
+    }
+
+    fn ms(&self, units: f64) -> f64 {
+        if self.log { 10f64.powf(units) } else { units }
+    }
+
+    /// Plot y of a reply time.
+    fn y(&self, ms: f64, http: bool) -> f64 {
+        let v = self.units(ms);
+        match self.http {
+            Some((lo, hi)) if http => self.main.0 + (v - lo) * (self.main.1 - self.main.0) / (hi - lo),
+            _ => v,
+        }
+    }
+
+    /// Reply time (HTTP scale) at a plot y.
+    fn http_ms(&self, y: f64) -> f64 {
+        match self.http {
+            Some((lo, hi)) => self.ms(lo + (y - self.main.0) * (hi - lo) / (self.main.1 - self.main.0)),
+            None => self.ms(y),
+        }
+    }
+
+    fn axes<'a>(&self) -> Vec<egui_plot::AxisHints<'a>> {
+        let me = *self;
+        let main_label = if self.main_is_http { "HTTP" } else { "ping" };
+        let mut axes = vec![
+            egui_plot::AxisHints::new_y()
+                .label(main_label)
+                .formatter(move |m, _| fmt_ms(me.ms(m.value)))
+                .min_thickness(48.0),
+        ];
+        if self.http.is_some() {
+            axes.push(
+                egui_plot::AxisHints::new_y()
+                    .label("HTTP")
+                    .placement(egui_plot::HPlacement::Right)
+                    .formatter(move |m, _| fmt_ms(me.http_ms(m.value)))
+                    .min_thickness(48.0),
+            );
+        }
+        axes
     }
 }
 
@@ -774,8 +927,16 @@ fn phase_bar(ui: &mut egui::Ui, phases: [f64; 4]) {
 }
 
 /// The hover card: every series at that moment, the one under the mouse
-/// stressed, where HTTP time went, and where you were.
-fn tooltip_ui(ui: &mut egui::Ui, x: f64, bucket_ms: i64, series: &[Series], highlight: Option<i64>, place: Option<&str>) {
+/// stressed, the reference marked, where HTTP time went, and where you were.
+fn tooltip_ui(
+    ui: &mut egui::Ui,
+    x: f64,
+    bucket_ms: i64,
+    series: &[Series],
+    highlight: Option<i64>,
+    reference: Option<i64>,
+    place: Option<&str>,
+) {
     let bucket_s = bucket_ms as f64 / 1000.0;
     let ms = (x * 1000.0) as i64;
     ui.horizontal(|ui| {
@@ -785,12 +946,15 @@ fn tooltip_ui(ui: &mut egui::Ui, x: f64, bucket_ms: i64, series: &[Series], high
     ui.add_space(2.0);
     let strong = ui.visuals().strong_text_color();
     let marked = ui.visuals().selection.bg_fill.gamma_multiply(0.6);
-    egui::Grid::new("tooltip").num_columns(5).spacing([12.0, 3.0]).show(ui, |ui| {
-        ui.label("");
-        ui.weak("median");
-        ui.weak("10–90 %");
-        ui.weak("min – max");
-        ui.weak("lost");
+    let num = |ui: &mut egui::Ui, t: RichText| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(t));
+    };
+    let plain = |v: f64| format!("{v:.1}");
+    egui::Grid::new("tooltip").num_columns(7).spacing([14.0, 3.0]).show(ui, |ui| {
+        ui.weak("ms");
+        for h in ["median", "P10", "P90", "min", "max", "lost"] {
+            num(ui, RichText::new(h).weak());
+        }
         ui.end_row();
         for s in series {
             let hl = highlight == Some(s.id());
@@ -800,32 +964,37 @@ fn tooltip_ui(ui: &mut egui::Ui, x: f64, bucket_ms: i64, series: &[Series], high
             ui.horizontal(|ui| {
                 swatch(ui, s.t.color, s.http);
                 ui.label(txt(s.label()));
+                if reference == Some(s.id()) {
+                    ui.label(RichText::new("reference").small().weak());
+                }
             });
             match bucket_at(s.buckets, ms, bucket_ms) {
                 None => {
-                    ui.weak("no data");
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
+                    num(ui, RichText::new("no data").weak());
+                    for _ in 0..5 {
+                        ui.label("");
+                    }
                 }
                 Some(b) => {
                     match b.pcts {
                         None => {
-                            ui.label(RichText::new("all lost").color(loss_color(1.0)));
-                            ui.label("");
-                            ui.label("");
+                            num(ui, RichText::new("all lost").color(loss_color(1.0)));
+                            for _ in 0..4 {
+                                ui.label("");
+                            }
                         }
                         Some(p) => {
-                            ui.label(txt(fmt_ms(p[MEDIAN])));
-                            ui.label(txt(format!("{} – {}", fmt_ms(p[P10]), fmt_ms(p[P90]))));
-                            ui.label(txt(format!("{} – {}", fmt_ms(p[MIN]), fmt_ms(p[MAX]))));
+                            for k in [MEDIAN, P10, P90, MIN, MAX] {
+                                let t = txt(plain(p[k]));
+                                num(ui, if k == MEDIAN { t.strong() } else { t });
+                            }
                         }
                     }
                     let what = format!("{}/{}", b.lost, b.count);
                     if b.lost > 0 {
-                        ui.label(RichText::new(what).color(loss_color(b.lost as f64 / b.count as f64)));
+                        num(ui, RichText::new(what).color(loss_color(b.lost as f64 / b.count as f64)));
                     } else {
-                        ui.weak(what);
+                        num(ui, RichText::new(what).weak());
                     }
                 }
             }
@@ -1050,12 +1219,13 @@ impl ViewerApp {
             loss_colours: self.loss_colours,
             show_ping: self.show_ping,
             show_http: self.show_http,
+            reference: self.reference.clone(),
             // without positions there is no map to show: keep the saved choice
             map: if self.has_fixes { self.map.is_some() } else { self.saved_prefs.map },
             color_by: self.map.as_ref().map_or(self.saved_prefs.color_by, |m| m.color_by()),
         };
         if prefs != self.saved_prefs {
-            self.saved_prefs = prefs;
+            self.saved_prefs = prefs.clone();
             if let Ok(text) = toml::to_string(&prefs) {
                 let _ = std::fs::write(prefs_path(), text);
             }
