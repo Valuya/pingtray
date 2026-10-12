@@ -73,17 +73,51 @@ enum Command {
 /// After a restart for new settings, the old process may hold the lock a
 /// moment longer: wait for it then.
 fn single_instance(name: &str) -> Result<Option<File>> {
-    let path = config::data_dir().join(name);
-    let file = File::create(&path).with_context(|| path.display().to_string())?;
     let patience = if std::env::var_os(collector::RESTARTED).is_some() { 50 } else { 1 };
+    lock(name, patience)
+}
+
+/// Tries `patience` times, 100 ms apart. The holder writes its PID in the file.
+fn lock(name: &str, patience: u32) -> Result<Option<File>> {
+    use std::io::Write;
+    let path = config::data_dir().join(name);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| path.display().to_string())?;
     for _ in 0..patience {
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                file.set_len(0)?;
+                write!(file, "{}", std::process::id())?;
+                return Ok(Some(file));
+            }
             Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
     Ok(None)
+}
+
+/// For windows: a new launch replaces an open one (which may be hidden
+/// behind others or on another workspace, and Wayland will not let it raise
+/// itself), so that a click always brings a window up front.
+fn take_over(name: &str) -> Result<Option<File>> {
+    if let Some(f) = lock(name, 1)? {
+        return Ok(Some(f));
+    }
+    let pid = std::fs::read_to_string(config::data_dir().join(name)).unwrap_or_default();
+    if let Ok(pid) = pid.trim().parse::<u32>()
+        && pid != std::process::id()
+    {
+        tracing::info!("replacing the open window (pid {pid})");
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    }
+    lock(name, 30)
 }
 
 fn autostart(remove: bool, config_path: &std::path::Path) -> Result<()> {
@@ -137,7 +171,7 @@ fn main() -> Result<()> {
             let lock = if std::env::var_os("PINGTRAY_SNAPSHOT").is_some() {
                 Some(None)
             } else {
-                single_instance("viewer.lock")?.map(Some)
+                take_over("viewer.lock")?.map(Some)
             };
             let Some(_lock) = lock else {
                 tracing::info!("viewer already open");
@@ -148,7 +182,7 @@ fn main() -> Result<()> {
         Command::Autostart { remove } => autostart(remove, &config_path),
         Command::Note { text } => notes::run(&text),
         Command::Settings { tab } => {
-            let Some(_lock) = single_instance("settings.lock")? else {
+            let Some(_lock) = take_over("settings.lock")? else {
                 tracing::info!("settings already open");
                 return Ok(());
             };
