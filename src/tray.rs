@@ -19,7 +19,12 @@ pub struct TrayState {
 /// Opens the big graph window in a separate process, so the tray stays light.
 pub fn open_viewer(config_path: &std::path::Path) {
     let exe = match std::env::current_exe() {
-        Ok(p) => p,
+        // after `cargo install` replaced us, Linux reports "<path> (deleted)":
+        // launch the new binary at the same path
+        Ok(p) => match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(s) => PathBuf::from(s),
+            None => p,
+        },
         Err(e) => return tracing::error!("cannot locate own executable: {e}"),
     };
     match std::process::Command::new(exe).arg("--config").arg(config_path).arg("view").spawn() {
