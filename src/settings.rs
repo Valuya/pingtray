@@ -271,6 +271,14 @@ impl SettingsApp {
             }
             copy_row(ui, "Or by address (changes with the network)", &owntracks);
             ui.weak("OwnTracks queues positions while this computer is out of reach and sends them later.");
+            if let Some(url) = &by_name {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("QR code: set OwnTracks up by scanning it with the phone").show(ui, |ui| {
+                    ui.weak("Scan with the phone's camera, open the link with OwnTracks, then tap Import.");
+                    ui.weak("It contains the token: do not share it.");
+                    qr(ui, &owntracks_config_uri(url, &token));
+                });
+            }
             copy_row(ui, "GPSLogger (custom URL)", &gpslogger);
         }
         ui.add_space(6.0);
@@ -342,6 +350,72 @@ impl SettingsApp {
                  An \"A\" on the icon means automatic.",
             );
         });
+    }
+}
+
+/// OwnTracks' configuration link: HTTP mode to pingtray, with the token as
+/// password, Move monitoring (a fix every 10 s while moving).
+fn owntracks_config_uri(url: &str, token: &str) -> String {
+    let json = serde_json::json!({
+        "_type": "configuration",
+        "mode": 3,
+        "url": url,
+        "username": "pingtray",
+        "password": token,
+        "monitoring": 2,
+        "moveModeLocatorInterval": 10,
+        "pubExtendedData": true,
+    });
+    let b64 = base64(json.to_string().as_bytes());
+    let escaped: String = b64
+        .chars()
+        .map(|c| match c {
+            '+' => "%2B".to_string(),
+            '/' => "%2F".to_string(),
+            '=' => "%3D".to_string(),
+            c => c.to_string(),
+        })
+        .collect();
+    format!("owntracks:///config?inline={escaped}")
+}
+
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Draws `text` as a QR code, black on white with a quiet zone.
+fn qr(ui: &mut egui::Ui, text: &str) {
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+        ui.label("Too long for a QR code.");
+        return;
+    };
+    let width = code.width();
+    let colors = code.to_colors();
+    let module = 4.0;
+    let quiet = 4.0 * module;
+    let side = width as f32 * module + 2.0 * quiet;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    for (i, c) in colors.iter().enumerate() {
+        if *c == qrcode::Color::Dark {
+            let (x, y) = ((i % width) as f32, (i / width) as f32);
+            let min = rect.min + egui::vec2(quiet + x * module, quiet + y * module);
+            painter.rect_filled(egui::Rect::from_min_size(min, egui::vec2(module, module)), 0.0, egui::Color32::BLACK);
+        }
     }
 }
 
@@ -433,6 +507,14 @@ pub fn run(cfg: Config, path: PathBuf, tab: Option<&str>) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b"pingtray"), "cGluZ3RyYXk=");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"abc"), "YWJj");
+        assert!(owntracks_config_uri("http://h.local:1/pub", "t").starts_with("owntracks:///config?inline="));
+    }
 
     #[test]
     fn config_roundtrips_through_toml() {
