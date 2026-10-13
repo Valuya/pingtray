@@ -219,6 +219,13 @@ impl SettingsApp {
 
     fn positions(&mut self, ui: &mut egui::Ui) {
         let loc: &mut LocationConfig = &mut self.cfg.location;
+        ui.checkbox(&mut loc.adb, RichText::new("Read the phone's GPS over ADB (recommended)").strong());
+        ui.weak(
+            "USB cable, or wireless debugging (pair once with adb pair). Only the local link is used: \
+             positions keep coming in dead zones. Keep an app asking for location (OwnTracks in Move mode) \
+             so that the phone's GPS stays on.",
+        );
+        ui.add_space(8.0);
         ui.checkbox(&mut loc.geoclue, "Use this computer's location service (GeoClue)");
         ui.weak(
             "Wi-Fi positioning where the networks around are known, a phone's GPS shared on the local network \
@@ -253,10 +260,14 @@ impl SettingsApp {
             ui.add_space(4.0);
             ui.label("Phone setup (the phone must be able to reach this computer, e.g. same Wi-Fi or tethering):");
             let owntracks = format!("http://{host}:{port}/pub");
+            let over_adb = format!("http://127.0.0.1:{port}/pub");
             let gpslogger = format!(
                 "http://{host}:{port}/log?token={token}&lat=%LAT&lon=%LON&acc=%ACC&spd=%SPD&time=%TIME"
             );
-            copy_row(ui, "OwnTracks (mode HTTP, password = token)", &owntracks);
+            if loc.adb {
+                copy_row(ui, "OwnTracks over ADB (fixed address, works offline; mode HTTP, password = token)", &over_adb);
+            }
+            copy_row(ui, "OwnTracks on the same network (mode HTTP, password = token)", &owntracks);
             copy_row(ui, "GPSLogger (custom URL)", &gpslogger);
         }
         ui.add_space(6.0);

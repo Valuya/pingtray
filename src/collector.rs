@@ -291,6 +291,11 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
 /// Phone positions: HTTP endpoint and watched folder, when configured.
 fn start_location_inputs(cfg: &Config) {
     let loc = &cfg.location;
+    if loc.adb {
+        // apps on the phone reach the endpoint at 127.0.0.1 through adb reverse
+        let port = loc.listen.as_deref().and_then(|l| l.rsplit(':').next()?.parse().ok());
+        crate::adb::spawn(config::db_path(), port);
+    }
     if loc.geoclue {
         crate::geoclue::ensure_desktop_file();
         crate::geoclue::spawn(config::db_path());

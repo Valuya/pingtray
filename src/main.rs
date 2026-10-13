@@ -1,3 +1,4 @@
+mod adb;
 mod collector;
 mod colors;
 mod config;
