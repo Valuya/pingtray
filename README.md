@@ -66,14 +66,17 @@ It uses UPower's charge threshold, the same switch as GNOME's settings.
 
 ## Phone positions
 
-**Recommended: the phone's GPS over ADB.** Connect the phone with a USB
-cable, or pair it once for wireless debugging (`adb pair`). pingtray then
-reads its latest fix every 15 s (`dumpsys location`) and keeps `adb reverse`
-up, so that OwnTracks on the phone can post to `http://127.0.0.1:18765/pub`,
-an address that never changes. Only the local link is used: positions keep
-coming where there is no mobile coverage, which is what pingtray is looking
-for. Keep an app asking for location (OwnTracks in Move mode) so that the
-phone's GPS stays on.
+**Recommended: OwnTracks on the phone, posting to this computer by name.**
+Turn on *Receive positions from my phone* in the settings and enter the URL
+shown there in OwnTracks (mode HTTP, password = the token):
+`http://<hostname>.local:18765/pub`. The name is announced on every network
+by avahi (mDNS) and Android resolves it, so it keeps working when the
+computer's address changes, and over the phone's hotspot without any mobile
+coverage. OwnTracks queues positions while the computer is out of reach.
+The firewall must let the phone in on that port.
+
+`adb` (USB or wireless debugging) can also feed the phone's fixes, as a
+debugging aid: `adb = true` under `[location]`.
 
 The computer's own location service (GeoClue: Wi-Fi positioning, or a GPS
 stream shared on the local network) is used too; IP-based guesses (often

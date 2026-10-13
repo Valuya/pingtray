@@ -169,13 +169,13 @@ pub struct LocationConfig {
     pub max_gap_secs: f64,
     /// Positions from this computer's location service (GeoClue).
     pub geoclue: bool,
-    /// Positions from a phone connected with ADB (USB or wireless debugging).
+    /// Positions from a phone connected with ADB: a debugging aid, off by default.
     pub adb: bool,
 }
 
 impl Default for LocationConfig {
     fn default() -> Self {
-        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0, geoclue: true, adb: true }
+        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0, geoclue: true, adb: false }
     }
 }
 

@@ -45,6 +45,13 @@ fn new_token() -> String {
     format!("{a:016x}{:016x}", h.finish())
 }
 
+/// This computer's mDNS name ("host.local"), announced by avahi.
+fn local_name() -> Option<String> {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+    let host = host.trim();
+    (!host.is_empty()).then(|| format!("{host}.local"))
+}
+
 /// The address other devices on the network see (no packet is sent).
 fn lan_ip() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -219,13 +226,6 @@ impl SettingsApp {
 
     fn positions(&mut self, ui: &mut egui::Ui) {
         let loc: &mut LocationConfig = &mut self.cfg.location;
-        ui.checkbox(&mut loc.adb, RichText::new("Read the phone's GPS over ADB (recommended)").strong());
-        ui.weak(
-            "USB cable, or wireless debugging (pair once with adb pair). Only the local link is used: \
-             positions keep coming in dead zones. Keep an app asking for location (OwnTracks in Move mode) \
-             so that the phone's GPS stays on.",
-        );
-        ui.add_space(8.0);
         ui.checkbox(&mut loc.geoclue, "Use this computer's location service (GeoClue)");
         ui.weak(
             "Wi-Fi positioning where the networks around are known, a phone's GPS shared on the local network \
@@ -260,14 +260,17 @@ impl SettingsApp {
             ui.add_space(4.0);
             ui.label("Phone setup (the phone must be able to reach this computer, e.g. same Wi-Fi or tethering):");
             let owntracks = format!("http://{host}:{port}/pub");
-            let over_adb = format!("http://127.0.0.1:{port}/pub");
+            // the name this computer announces on every network (mDNS):
+            // stable, unlike its address
+            let by_name = local_name().map(|n| format!("http://{n}:{port}/pub"));
             let gpslogger = format!(
                 "http://{host}:{port}/log?token={token}&lat=%LAT&lon=%LON&acc=%ACC&spd=%SPD&time=%TIME"
             );
-            if loc.adb {
-                copy_row(ui, "OwnTracks over ADB (fixed address, works offline; mode HTTP, password = token)", &over_adb);
+            if let Some(url) = &by_name {
+                copy_row(ui, "OwnTracks: mode HTTP, this URL, password = token (works on any network, no internet needed)", url);
             }
-            copy_row(ui, "OwnTracks on the same network (mode HTTP, password = token)", &owntracks);
+            copy_row(ui, "Or by address (changes with the network)", &owntracks);
+            ui.weak("OwnTracks queues positions while this computer is out of reach and sends them later.");
             copy_row(ui, "GPSLogger (custom URL)", &gpslogger);
         }
         ui.add_space(6.0);
