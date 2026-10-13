@@ -251,11 +251,16 @@ pub fn rgba_to_argb(mut px: Vec<u8>) -> Vec<u8> {
     px
 }
 
-/// Writes icons under fresh names (GNOME caches icons by path) and removes
-/// the previous files.
+/// Writes icons alternately to two files, as indicator-multiload does.
+///
+/// Two, not one: GNOME caches icons by path, so the path must change for a
+/// new image to show. And not a new name each time: gnome-shell keeps a file
+/// monitor (a main-loop source) for every icon file it ever loaded, so fresh
+/// names made its main loop slower and slower (100 % CPU after a few days).
 pub struct IconSink {
     dir: PathBuf,
     counter: u64,
+    last: Option<(String, PathBuf)>,
 }
 
 impl IconSink {
@@ -264,30 +269,44 @@ impl IconSink {
         for entry in std::fs::read_dir(dir)?.flatten() {
             let _ = std::fs::remove_file(entry.path());
         }
-        Ok(IconSink { dir: dir.to_path_buf(), counter: 0 })
+        Ok(IconSink { dir: dir.to_path_buf(), counter: 0, last: None })
     }
 
+    /// The path of the icon; unchanged (and nothing written) when the image is.
     pub fn write_svg(&mut self, svg: &str) -> std::io::Result<PathBuf> {
-        self.counter += 1;
-        let path = self.dir.join(format!("icon-{}.svg", self.counter));
-        std::fs::write(&path, svg)?;
-        self.forget_old();
-        Ok(path)
-    }
-
-    /// Keeps the previous file: the shell may still be loading it.
-    fn forget_old(&self) {
-        if self.counter > 2 {
-            for ext in ["png", "svg"] {
-                let _ = std::fs::remove_file(self.dir.join(format!("icon-{}.{ext}", self.counter - 2)));
-            }
+        if let Some((last, path)) = &self.last
+            && last == svg
+        {
+            return Ok(path.clone());
         }
+        self.counter += 1;
+        let path = self.dir.join(format!("icon-{}.svg", self.counter % 2));
+        // write then rename, so the shell never reads a half-written file
+        let tmp = self.dir.join("icon.tmp");
+        std::fs::write(&tmp, svg)?;
+        std::fs::rename(&tmp, &path)?;
+        self.last = Some((svg.to_string(), path.clone()));
+        Ok(path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_alternates_two_files_and_skips_identical_images() {
+        let dir = std::env::temp_dir().join(format!("pingtray-sink-{}", std::process::id()));
+        let mut sink = IconSink::new(&dir).unwrap();
+        let a = sink.write_svg("<svg>a</svg>").unwrap();
+        assert_eq!(sink.write_svg("<svg>a</svg>").unwrap(), a);
+        let b = sink.write_svg("<svg>b</svg>").unwrap();
+        let c = sink.write_svg("<svg>c</svg>").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn column_percentiles_and_loss() {

@@ -148,11 +148,15 @@ struct TrayFeed {
     thresholds: Thresholds,
     height: usize,
     last: Option<Instant>,
+    /// What the tray shows now: icon, tooltip, menu lines.
+    shown: Option<(Option<PathBuf>, String, Vec<String>)>,
 }
 
 impl TrayFeed {
     async fn refresh(&mut self, live: &Live, cfg: &Config) {
-        if self.last.is_some_and(|t| t.elapsed() < Duration::from_millis(900)) {
+        // every update makes the panel reload the icon and rebuild the menu:
+        // keep them rare
+        if self.last.is_some_and(|t| t.elapsed() < TRAY_REFRESH) {
             return;
         }
         self.last = Some(Instant::now());
@@ -163,16 +167,26 @@ impl TrayFeed {
         let icon_file = self.sink.as_mut().and_then(|s| {
             s.write_svg(&svg).map_err(|e| tracing::warn!("writing icon: {e}")).ok()
         });
+        let tooltip = live.tooltip(cfg, which);
+        let status = live.status_lines(which);
+        let shown = (icon_file.clone(), tooltip.clone(), status.clone());
+        if self.shown.as_ref() == Some(&shown) {
+            return;
+        }
+        self.shown = Some(shown);
         let state = TrayState {
             icon_file,
             pixmap: (w, h, icon::rgba_to_argb(rgba)),
-            tooltip: live.tooltip(cfg, which),
-            status: live.status_lines(which),
+            tooltip,
+            status,
             ..self.base.clone()
         };
         self.handle.update(state).await;
     }
 }
+
+/// Shortest time between two tray updates.
+const TRAY_REFRESH: Duration = Duration::from_secs(5);
 
 /// Set in the environment of a collector restarted for new settings.
 pub const RESTARTED: &str = "PINGTRAY_RESTARTED";
@@ -228,7 +242,9 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
     let mut sink = IconSink::new(&config::runtime_dir().join("power-icons")).ok();
     let rt = tokio::runtime::Handle::current();
     let height = cfg.icon_height;
+    let mut last_shown = None;
     crate::power::spawn(cfg.power.clone(), cfg.location.max_gap_ms(), automatic, move |s: &Status| {
+        let automatic_now = s.automatic;
         let Some(handle) = &handle else { return };
         let b = s.battery;
         let (w, h, rgba) = icon::render_battery(b.percentage, b.preserve, b.end_threshold, b.charging, height);
@@ -254,6 +270,12 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
             let what = if *action == Action::Maximize { "Switched to maximize" } else { "Switched to preserve" };
             status.push(format!("{what}: {why}"));
         }
+        // nothing new to show: no update, the panel would redo its work
+        let shown = (icon_file.clone(), status.clone(), automatic_now, b.preserve);
+        if last_shown.as_ref() == Some(&shown) {
+            return;
+        }
+        last_shown = Some(shown);
         let state = PowerTrayState {
             icon_file,
             pixmap: (w, h, icon::rgba_to_argb(rgba)),
@@ -332,7 +354,7 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
                 .map_err(|e| tracing::warn!("icon directory: {e}"))
                 .ok();
             let thresholds = Thresholds { warn_ms: cfg.warn_ms, bad_ms: cfg.bad_ms };
-            tray = Some(TrayFeed { handle, sink, base, thresholds, height: cfg.icon_height, last: None });
+            tray = Some(TrayFeed { handle, sink, base, thresholds, height: cfg.icon_height, last: None, shown: None });
         }
     }
 

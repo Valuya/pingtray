@@ -199,7 +199,8 @@ mod sni {
     }
 
     pub async fn spawn(state: TrayState) -> Option<ksni::Handle<SniTray>> {
-        match SniTray(state).spawn().await {
+        // at login pingtray may start before the panel: wait for it
+        match SniTray(state).assume_sni_available(true).spawn().await {
             Ok(h) => Some(h),
             Err(e) => {
                 tracing::warn!("no system tray available ({e}); collecting without an icon");
@@ -324,7 +325,12 @@ mod power_sni {
     }
 
     pub async fn spawn(state: PowerTrayState) -> Option<ksni::Handle<PowerTray>> {
-        PowerTray(state).spawn().await.map_err(|e| tracing::warn!("charging icon: {e}")).ok()
+        PowerTray(state)
+            .assume_sni_available(true)
+            .spawn()
+            .await
+            .map_err(|e| tracing::warn!("charging icon: {e}"))
+            .ok()
     }
 }
 
