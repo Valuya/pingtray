@@ -219,6 +219,12 @@ impl SettingsApp {
 
     fn positions(&mut self, ui: &mut egui::Ui) {
         let loc: &mut LocationConfig = &mut self.cfg.location;
+        ui.checkbox(&mut loc.geoclue, "Use this computer's location service (GeoClue)");
+        ui.weak(
+            "Wi-Fi positioning where the networks around are known, a phone's GPS shared on the local network \
+             (works over the hotspot link even without mobile coverage), else a rough IP-based guess.",
+        );
+        ui.add_space(8.0);
         let mut receive = loc.listen.is_some();
         if ui.checkbox(&mut receive, "Receive positions from my phone").changed() {
             loc.listen = receive.then(|| DEFAULT_LISTEN.to_string());

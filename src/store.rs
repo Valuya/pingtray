@@ -26,6 +26,23 @@ pub struct Note {
     pub text: String,
 }
 
+/// Sources differ wildly (phone GPS: 5 m, Wi-Fi: 50 m, IP guess: 25 km):
+/// drop a fix when a much more accurate one exists around the same time, so
+/// that a coarse guess does not tear a precise track apart.
+pub fn drop_vague(fixes: Vec<Fix>) -> Vec<Fix> {
+    const AROUND_MS: i64 = 120_000;
+    let acc = |f: &Fix| f.acc_m.unwrap_or(crate::location::DEFAULT_ACC_M);
+    let keep: Vec<bool> = (0..fixes.len())
+        .map(|i| {
+            let f = &fixes[i];
+            let lo = fixes.partition_point(|g| g.ts_ms < f.ts_ms - AROUND_MS);
+            let hi = fixes.partition_point(|g| g.ts_ms <= f.ts_ms + AROUND_MS);
+            acc(f) <= crate::geoclue::USELESS_M && !fixes[lo..hi].iter().any(|g| acc(g) * 4.0 < acc(f))
+        })
+        .collect();
+    fixes.into_iter().zip(keep).filter_map(|(f, k)| k.then_some(f)).collect()
+}
+
 /// Percentiles kept per bucket, SmokePing style.
 /// Every 5 %, so that the smoke can fade smoothly.
 pub const PCTS: [f64; 21] = [
@@ -240,7 +257,7 @@ impl Store {
         })?;
         let mut out: Vec<Fix> = rows.collect::<Result<_, _>>()?;
         out.dedup_by_key(|f| f.ts_ms);
-        Ok(out)
+        Ok(drop_vague(out))
     }
 
     pub fn has_fixes(&self) -> Result<bool> {
@@ -441,6 +458,10 @@ mod tests {
             .insert_samples(&[(id, 1000, Some(10_000)), (id, 2000, Some(30_000)), (id, 3000, None), (id, 11_000, None)])
             .unwrap();
         let b = store.buckets(id, 0, 20_000, 10_000).unwrap();
+        let fix = |ts_ms, acc| Fix { ts_ms, lat: 50.0, lon: 4.0, acc_m: Some(acc), alt_m: None, speed_ms: None };
+        let kept = drop_vague(vec![fix(0, 25_000.0), fix(30_000, 8.0), fix(600_000, 25_000.0)]);
+        // a 25 km guess goes, alone or next to a GPS fix
+        assert_eq!(kept.iter().map(|f| f.ts_ms).collect::<Vec<_>>(), vec![30_000]);
         assert_eq!(b.len(), 2);
         assert_eq!(b[0].pcts.unwrap()[MEDIAN], 20.0);
         assert_eq!((b[0].count, b[0].lost), (3, 1));

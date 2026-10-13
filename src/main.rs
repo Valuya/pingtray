@@ -1,6 +1,7 @@
 mod collector;
 mod colors;
 mod config;
+mod geoclue;
 mod http_probe;
 mod icon;
 mod location;

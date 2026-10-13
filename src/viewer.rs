@@ -289,7 +289,8 @@ impl ViewerApp {
             loaded: None,
             segments: Vec::new(),
             has_fixes,
-            map: prefs.map.then(|| MapView::new(&cc.egui_ctx, prefs.color_by)),
+            // no positions yet: no map, until asked for
+            map: (prefs.map && has_fixes).then(|| MapView::new(&cc.egui_ctx, prefs.color_by)),
             saved_prefs: prefs.clone(),
             hover_x: None,
             highlight: None,
@@ -1290,7 +1291,8 @@ impl ViewerApp {
             show_http: self.show_http,
             reference: self.reference.clone(),
             // without positions there is no map to show: keep the saved choice
-            map: self.map.is_some(),
+            // without positions the map stays closed at start: keep the wish
+            map: if self.has_fixes || self.map.is_some() { self.map.is_some() } else { self.saved_prefs.map },
             color_by: self.map.as_ref().map_or(self.saved_prefs.color_by, |m| m.color_by()),
         };
         if prefs != self.saved_prefs {

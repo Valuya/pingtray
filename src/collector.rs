@@ -291,6 +291,10 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
 /// Phone positions: HTTP endpoint and watched folder, when configured.
 fn start_location_inputs(cfg: &Config) {
     let loc = &cfg.location;
+    if loc.geoclue {
+        crate::geoclue::ensure_desktop_file();
+        crate::geoclue::spawn(config::db_path());
+    }
     if let Some(listen) = &loc.listen {
         let started = listen
             .parse()

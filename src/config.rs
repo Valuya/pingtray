@@ -167,11 +167,13 @@ pub struct LocationConfig {
     pub watch_dir: Option<PathBuf>,
     /// A ping farther than this from any position gets none.
     pub max_gap_secs: f64,
+    /// Positions from this computer's location service (GeoClue).
+    pub geoclue: bool,
 }
 
 impl Default for LocationConfig {
     fn default() -> Self {
-        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0 }
+        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0, geoclue: true }
     }
 }
 
