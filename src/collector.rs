@@ -291,6 +291,7 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
 /// Phone positions: HTTP endpoint and watched folder, when configured.
 fn start_location_inputs(cfg: &Config) {
     let loc = &cfg.location;
+    crate::nmea::spawn(&loc.nmea, config::db_path());
     if loc.adb {
         // apps on the phone reach the endpoint at 127.0.0.1 through adb reverse
         let port = loc.listen.as_deref().and_then(|l| l.rsplit(':').next()?.parse().ok());

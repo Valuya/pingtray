@@ -171,11 +171,31 @@ pub struct LocationConfig {
     pub geoclue: bool,
     /// Positions from a phone connected with ADB: a debugging aid, off by default.
     pub adb: bool,
+    /// The phone's GPS as an NMEA stream on the local network (gpsdRelay).
+    pub nmea: NmeaConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct NmeaConfig {
+    /// Listen for NMEA sent (broadcast) by the phone over UDP.
+    pub udp_port: Option<u16>,
+    /// Connect to an NMEA server on the phone over TCP.
+    pub tcp_port: Option<u16>,
+    /// The phone's address for TCP; default: the gateway (the phone, while tethered).
+    pub tcp_host: Option<String>,
+}
+
+impl Default for NmeaConfig {
+    fn default() -> Self {
+        // 10110: the usual port for NMEA over IP
+        NmeaConfig { udp_port: Some(10110), tcp_port: None, tcp_host: None }
+    }
 }
 
 impl Default for LocationConfig {
     fn default() -> Self {
-        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0, geoclue: true, adb: false }
+        LocationConfig { listen: None, token: None, watch_dir: None, max_gap_secs: 600.0, geoclue: true, adb: false, nmea: NmeaConfig::default() }
     }
 }
 

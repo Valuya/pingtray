@@ -226,6 +226,38 @@ impl SettingsApp {
 
     fn positions(&mut self, ui: &mut egui::Ui) {
         let loc: &mut LocationConfig = &mut self.cfg.location;
+        ui.label(RichText::new("The phone's GPS on the local network (recommended)").strong());
+        ui.weak(
+            "With gpsdRelay on the phone (Android, F-Droid). Only the local link is used, so positions keep \
+             coming without mobile coverage, and nothing has to find anything: the phone broadcasts, or \
+             pingtray connects to it (while tethered, it is the gateway).",
+        );
+        let nmea = &mut loc.nmea;
+        ui.horizontal(|ui| {
+            let mut udp = nmea.udp_port.is_some();
+            if ui.checkbox(&mut udp, "Listen on UDP port").changed() {
+                nmea.udp_port = udp.then_some(10110);
+            }
+            if let Some(port) = &mut nmea.udp_port {
+                ui.add(egui::DragValue::new(port).range(1024..=65535));
+                ui.weak("in gpsdRelay: a UDP server, broadcast, this port");
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut tcp = nmea.tcp_port.is_some();
+            if ui.checkbox(&mut tcp, "Connect over TCP to port").changed() {
+                nmea.tcp_port = tcp.then_some(10110);
+            }
+            if let Some(port) = &mut nmea.tcp_port {
+                ui.add(egui::DragValue::new(port).range(1..=65535));
+                ui.label("on");
+                let mut host = nmea.tcp_host.clone().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut host).hint_text("the gateway").desired_width(140.0)).changed() {
+                    nmea.tcp_host = (!host.trim().is_empty()).then(|| host.trim().to_string());
+                }
+            }
+        });
+        ui.add_space(10.0);
         ui.checkbox(&mut loc.geoclue, "Use this computer's location service (GeoClue)");
         ui.weak(
             "Wi-Fi positioning where the networks around are known, a phone's GPS shared on the local network \

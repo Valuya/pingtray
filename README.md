@@ -66,14 +66,20 @@ It uses UPower's charge threshold, the same switch as GNOME's settings.
 
 ## Phone positions
 
-**Recommended: OwnTracks on the phone, posting to this computer by name.**
-Turn on *Receive positions from my phone* in the settings and enter the URL
-shown there in OwnTracks (mode HTTP, password = the token):
-`http://<hostname>.local:18765/pub`. The name is announced on every network
-by avahi (mDNS) and Android resolves it, so it keeps working when the
-computer's address changes, and over the phone's hotspot without any mobile
-coverage. OwnTracks queues positions while the computer is out of reach.
-The firewall must let the phone in on that port.
+**Recommended: the phone's GPS as an NMEA stream on the local network**,
+with [gpsdRelay](https://f-droid.org/packages/io.github.project_kaat.gpsdrelay/)
+(Android, F-Droid). Either the phone broadcasts over UDP and pingtray
+listens (port 10110 by default), or the phone runs a TCP server and
+pingtray connects to it (by default at the gateway, which is the phone
+while tethered). Nothing has to find anything, and only the local link is
+used: positions keep coming without mobile coverage, which is what
+pingtray is looking for. The firewall must let UDP 10110 in from the local
+network.
+
+OwnTracks also works (HTTP mode, `http://<hostname>.local:18765/pub`, or
+the computer's address; a QR code in the settings sets it up), but it
+relies on the phone resolving the computer's mDNS name, which proved
+unreliable on Android.
 
 `adb` (USB or wireless debugging) can also feed the phone's fixes, as a
 debugging aid: `adb = true` under `[location]`.

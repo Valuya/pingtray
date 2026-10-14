@@ -7,6 +7,7 @@ mod http_probe;
 mod icon;
 mod location;
 mod map;
+mod nmea;
 mod notes;
 mod pinger;
 mod power;
