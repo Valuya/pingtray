@@ -30,6 +30,8 @@ pub struct SettingsApp {
     lan_ip: Option<std::net::IpAddr>,
     /// Networks connected when the window opened (asking NetworkManager every frame is slow).
     networks_now: Vec<String>,
+    /// The mDNS name avahi announces, read when the window opened.
+    announced: Option<String>,
     snapshot: Option<(PathBuf, u32)>,
 }
 
@@ -47,9 +49,7 @@ fn new_token() -> String {
 
 /// This computer's mDNS name ("host.local"), announced by avahi.
 fn local_name() -> Option<String> {
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
-    let host = host.trim();
-    (!host.is_empty()).then(|| format!("{host}.local"))
+    crate::mdns::hostname().map(|h| format!("{h}.local"))
 }
 
 /// The address other devices on the network see (no packet is sent).
@@ -70,6 +70,7 @@ impl SettingsApp {
             message: None,
             lan_ip: lan_ip(),
             networks_now: crate::power::active_networks(),
+            announced: crate::mdns::announced(),
             snapshot: std::env::var_os("PINGTRAY_SNAPSHOT").map(|p| (PathBuf::from(p), 0)),
         }
     }
@@ -300,6 +301,17 @@ impl SettingsApp {
             );
             if let Some(url) = &by_name {
                 copy_row(ui, "OwnTracks: mode HTTP, this URL, password = token (works on any network, no internet needed)", url);
+                if let (Some(want), Some(now)) = (local_name(), &self.announced)
+                    && &want != now
+                {
+                    ui.label(
+                        RichText::new(format!(
+                            "This computer is announced as {now}, not {want}: the phone will not find it. \
+                             pingtray puts the name back if your user is in the netdev group."
+                        ))
+                        .color(egui::Color32::from_rgb(0xff, 0x78, 0x00)),
+                    );
+                }
             }
             copy_row(ui, "Or by address (changes with the network)", &owntracks);
             ui.weak("OwnTracks queues positions while this computer is out of reach and sends them later.");
