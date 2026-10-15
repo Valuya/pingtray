@@ -2,6 +2,7 @@ mod adb;
 mod collector;
 mod colors;
 mod config;
+mod daily;
 mod geoclue;
 mod http_probe;
 mod icon;

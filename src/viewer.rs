@@ -1365,6 +1365,22 @@ impl ViewerApp {
         Some(rgb(colors::quality_rgb(worst_loss, worst_median, self.thresholds)))
     }
 
+    /// The stored series behind the reference (picked by clicking a curve).
+    fn reference_id(&self) -> Option<i64> {
+        let key = self.reference.as_deref();
+        let by_key = self.targets.iter().find_map(|t| {
+            let name = &t.row.name;
+            if key == Some(format!("{name}|ping").as_str()) {
+                Some(t.row.id)
+            } else if key == Some(format!("{name}|http").as_str()) {
+                t.http.as_ref().map(|h| h.id)
+            } else {
+                None
+            }
+        });
+        by_key.or_else(|| self.targets.iter().find(|t| t.shown).map(|t| t.row.id))
+    }
+
     fn map_panel(&mut self, ui: &mut egui::Ui) {
         let Some(mut map) = self.map.take() else { return };
         let empty = Vec::new();
@@ -1378,6 +1394,8 @@ impl ViewerApp {
             quality: &quality,
             max_gap_ms: self.max_gap_ms,
             ever: self.has_fixes,
+            reference_id: self.reference_id(),
+            thresholds: self.thresholds,
         };
         let (clicked, setup) = map.ui(ui, &input);
         if setup {

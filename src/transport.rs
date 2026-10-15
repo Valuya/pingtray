@@ -447,6 +447,15 @@ fn parse_tile(json: &str) -> Vec<(Mode, Vec<(f64, f64)>)> {
 /// Railways around a stretch of track, from the cache or Overpass.
 /// `None` when some tile could not be obtained (offline, rate-limited).
 pub fn rails_for(store: &Store, track: &[Fix]) -> Option<Rails> {
+    rails_lookup(store, track, true)
+}
+
+/// Like [`rails_for`], from the cache only: for looking back over many days.
+pub fn rails_cached(store: &Store, track: &[Fix]) -> Option<Rails> {
+    rails_lookup(store, track, false)
+}
+
+fn rails_lookup(store: &Store, track: &[Fix], fetch: bool) -> Option<Rails> {
     let tiles: HashSet<(u32, u32)> = track.iter().map(|f| tile_of(f.lat, f.lon)).collect();
     let now = crate::pinger::now_ms();
     let mut ways = Vec::new();
@@ -455,6 +464,7 @@ pub fn rails_for(store: &Store, track: &[Fix]) -> Option<Rails> {
         let cached = store.rail_tile(RAIL_ZOOM, x, y).ok().flatten();
         let json = match cached {
             Some((fetched, json)) if now - fetched < RAIL_MAX_AGE_MS => Some(json),
+            _ if !fetch => cached.map(|(_, stale)| stale),
             _ => {
                 // public servers throttle: one retry after a pause
                 let fetched = fetch_tile(x, y).or_else(|_| {

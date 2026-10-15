@@ -209,6 +209,17 @@ impl Store {
         Ok(())
     }
 
+    /// Raw samples of one target in `[from_ms, to_ms)`, oldest first; RTT in ms.
+    pub fn samples_between(&self, target_id: i64, from_ms: i64, to_ms: i64) -> Result<Vec<(i64, Option<f64>)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ts_ms, rtt_us FROM sample WHERE target_id = ?1 AND ts_ms >= ?2 AND ts_ms < ?3 ORDER BY ts_ms",
+        )?;
+        let rows = stmt.query_map(params![target_id, from_ms, to_ms], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.map(|us| us as f64 / 1000.0)))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Raw samples of one target since `from_ms`, oldest first; RTT in ms.
     pub fn samples_since(&self, target_id: i64, from_ms: i64) -> Result<Vec<(i64, Option<f64>)>> {
         let mut stmt = self.conn.prepare_cached(
@@ -258,6 +269,10 @@ impl Store {
         let mut out: Vec<Fix> = rows.collect::<Result<_, _>>()?;
         out.dedup_by_key(|f| f.ts_ms);
         Ok(drop_vague(out))
+    }
+
+    pub fn first_fix_ms(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT MIN(ts_ms) FROM location", [], |r| r.get(0))?)
     }
 
     pub fn has_fixes(&self) -> Result<bool> {

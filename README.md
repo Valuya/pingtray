@@ -42,6 +42,22 @@ applies the changes at once (pingtray restarts itself).
 They are stored in `~/.config/pingtray/config.toml`. History is kept per
 destination name: renaming one starts a new history.
 
+## Map
+
+*Map* in the graph window. Zoom with the wheel, drag to move; *Fit* frames
+what is shown.
+
+- **Track**: the chart's range, or untick *Follow the chart* and pick any
+  slice of history with the slider (15 min to a day before that time).
+  Coloured by connection quality or transport mode; dotted where the route
+  between two positions is unknown.
+- **Every day at…**: every day's pings around one time of day (e.g. 8:30
+  ±15 min, last 30 days, weekdays only), placed where they were sent from
+  and merged into ~200 m cells: the usual connection along a regular
+  journey at that hour.
+- **Transport filter**: all, or only some modes (train / tram, car / bus,
+  on foot…). While travelling, the current mode is preselected.
+
 ## Notes
 
 *Add note…* in the tray menu (or *Note…* in the graph window, or
