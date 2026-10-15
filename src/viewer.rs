@@ -481,6 +481,7 @@ impl ViewerApp {
         let mut hover: Option<(Option<f64>, f32)> = None;
         let mut double_clicked = false;
         let mut new_highlight = None;
+        let hovered = self.highlight;
         let mut new_reference = None;
 
         if !self.segments.is_empty() {
@@ -564,7 +565,15 @@ impl ViewerApp {
                     // grey smoke, median coloured by loss
                     let (smoke, median) =
                         if loss_colours && is_reference { (grey, None) } else { (s.t.color, Some(s.t.color)) };
-                    let emphasis = if is_reference { Emphasis::Highlight } else { Emphasis::Dim };
+                    // the selected curve stands out; the one under the mouse
+                    // brightens, to show what a click would select
+                    let emphasis = if is_reference {
+                        Emphasis::Highlight
+                    } else if hovered == Some(s.id()) {
+                        Emphasis::Hover
+                    } else {
+                        Emphasis::Dim
+                    };
                     let http = s.http;
                     draw_target(pui, s.buckets, bucket_s, smoke, median, |ms| scale.y(ms, http), &s.label(), http, emphasis, is_reference);
                 }
@@ -749,6 +758,8 @@ fn loss_color(loss: f64) -> Color32 {
 enum Emphasis {
     /// The selected curve (the reference).
     Highlight,
+    /// Under the mouse: what a click would select.
+    Hover,
     /// The others.
     Dim,
 }
@@ -776,6 +787,7 @@ fn draw_target(
     };
     let width: f32 = match emphasis {
         Emphasis::Highlight => 3.0,
+        Emphasis::Hover => 2.6,
         Emphasis::Dim => 1.2,
     };
     let edge = bucket_s * 0.001;
@@ -814,7 +826,7 @@ fn draw_target(
         }
     }
 
-    let alpha = if reference { 1.0 } else { 0.55 * fade };
+    let alpha = if reference || emphasis == Emphasis::Hover { 1.0 } else { 0.55 * fade };
     for run in &runs {
         // steps: flat across each time slot
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(run.len() * 2);
@@ -834,7 +846,7 @@ fn draw_target(
             let i = colours.partition_point(|s| s.0 <= p.x).saturating_sub(1);
             colours.get(i).map(|s| s.1).unwrap_or(Color32::GRAY)
         });
-        let w = if reference { width } else { width.min(1.4) };
+        let w = if reference || emphasis == Emphasis::Hover { width } else { width.min(1.4) };
         let mut line = Line::new(name, PlotPoints::from(pts)).gradient_color(gradient, false).width(w);
         if http {
             line = line.style(egui_plot::LineStyle::dashed_dense());
