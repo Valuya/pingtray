@@ -317,6 +317,11 @@ impl SettingsApp {
             ui.weak("OwnTracks queues positions while this computer is out of reach and sends them later.");
             if let Some(url) = &by_name {
                 ui.add_space(6.0);
+                egui::CollapsingHeader::new("QR code: set up pingtray for Android").show(ui, |ui| {
+                    ui.weak("Scan with the phone's camera and open the link with pingtray (Android).");
+                    ui.weak("It contains the token: do not share it.");
+                    qr(ui, &android_config_uri(url, &token));
+                });
                 egui::CollapsingHeader::new("QR code: set OwnTracks up by scanning it with the phone").show(ui, |ui| {
                     ui.weak("Scan with the phone's camera, open the link with OwnTracks, then tap Import.");
                     ui.weak("It contains the token: do not share it.");
@@ -421,6 +426,19 @@ fn owntracks_config_uri(url: &str, token: &str) -> String {
         })
         .collect();
     format!("owntracks:///config?inline={escaped}")
+}
+
+/// pingtray for Android's setup link: where to send positions, and the token.
+fn android_config_uri(url: &str, token: &str) -> String {
+    let enc = |v: &str| -> String {
+        v.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
+    format!("pingtray://config?url={}&token={}", enc(url), enc(token))
 }
 
 fn base64(data: &[u8]) -> String {
@@ -558,6 +576,10 @@ mod tests {
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"abc"), "YWJj");
         assert!(owntracks_config_uri("http://h.local:1/pub", "t").starts_with("owntracks:///config?inline="));
+        assert_eq!(
+            android_config_uri("http://h.local:18765/pub", "ab12"),
+            "pingtray://config?url=http%3A%2F%2Fh.local%3A18765%2Fpub&token=ab12"
+        );
     }
 
     #[test]
