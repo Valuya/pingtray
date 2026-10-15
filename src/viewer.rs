@@ -480,7 +480,6 @@ impl ViewerApp {
         let mut dragged_to = None;
         let mut hover: Option<(Option<f64>, f32)> = None;
         let mut double_clicked = false;
-        let highlight = self.highlight;
         let mut new_highlight = None;
         let mut new_reference = None;
 
@@ -529,7 +528,9 @@ impl ViewerApp {
             );
             let (y_min, y_max) = scale.bounds();
             // the hovered curve (last frame) and its axis
-            let focus = highlight.and_then(|id| series.iter().find(|s| s.id() == id)).map(|s| (s.http, s.t.color));
+            // the selected curve (the reference, picked by clicking) and its
+            // axis stand out; hovering changes nothing, which would flicker
+            let focus = series.get(reference).map(|s| (s.http, s.t.color));
             let last = i + 1 == n;
             // with several targets on one chart, loss colours would be ambiguous
             let loss_colours = self.loss_colours && series.len() == 1;
@@ -563,11 +564,7 @@ impl ViewerApp {
                     // grey smoke, median coloured by loss
                     let (smoke, median) =
                         if loss_colours && is_reference { (grey, None) } else { (s.t.color, Some(s.t.color)) };
-                    let emphasis = match highlight {
-                        Some(id) if id == s.id() => Emphasis::Highlight,
-                        _ if is_reference => Emphasis::Normal,
-                        _ => Emphasis::Dim,
-                    };
+                    let emphasis = if is_reference { Emphasis::Highlight } else { Emphasis::Dim };
                     let http = s.http;
                     draw_target(pui, s.buckets, bucket_s, smoke, median, |ms| scale.y(ms, http), &s.label(), http, emphasis, is_reference);
                 }
@@ -750,10 +747,9 @@ fn loss_color(loss: f64) -> Color32 {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Emphasis {
-    Normal,
-    /// The curve under the mouse.
+    /// The selected curve (the reference).
     Highlight,
-    /// The others, while one is highlighted.
+    /// The others.
     Dim,
 }
 
@@ -780,7 +776,6 @@ fn draw_target(
     };
     let width: f32 = match emphasis {
         Emphasis::Highlight => 3.0,
-        Emphasis::Normal => 2.0,
         Emphasis::Dim => 1.2,
     };
     let edge = bucket_s * 0.001;

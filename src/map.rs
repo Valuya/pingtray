@@ -13,6 +13,10 @@ pub enum ColorBy {
     Transport,
 }
 
+/// Fixes closer than this are joined by a solid line; farther apart, the
+/// path between them is unknown and drawn dotted.
+const TRUSTED_GAP_MS: i64 = 90_000;
+
 pub struct MapView {
     tiles: HttpTiles,
     memory: MapMemory,
@@ -149,8 +153,19 @@ impl MapView {
                     let acc = w[0].acc_m.unwrap_or(DEFAULT_ACC_M).max(w[1].acc_m.unwrap_or(DEFAULT_ACC_M));
                     let sure = (1.0 - (acc as f32 - 20.0) / 200.0).clamp(0.3, 1.0);
                     let (a, b) = (pos(&w[0]), pos(&w[1]));
-                    painter.line_segment([a, b], Stroke::new(6.0, Color32::from_black_alpha((140.0 * sure) as u8)));
-                    painter.line_segment([a, b], Stroke::new(3.5, color_at(mid).gamma_multiply(sure)));
+                    if w[1].ts_ms - w[0].ts_ms <= TRUSTED_GAP_MS {
+                        painter.line_segment([a, b], Stroke::new(6.0, Color32::from_black_alpha((140.0 * sure) as u8)));
+                        painter.line_segment([a, b], Stroke::new(3.5, color_at(mid).gamma_multiply(sure)));
+                    } else {
+                        // minutes between fixes: the real route is unknown,
+                        // a straight line would cross places never visited
+                        painter.extend(egui::Shape::dotted_line(&[a, b], color_at(mid).gamma_multiply(0.5), 7.0, 1.6));
+                    }
+                }
+                // the measured positions themselves
+                for f in &visible {
+                    painter.circle_filled(pos(f), 2.5, Color32::from_black_alpha(170));
+                    painter.circle_filled(pos(f), 1.6, Color32::WHITE);
                 }
                 let dot = |p: Pos2, fill: Color32| {
                     painter.circle(p, 5.0, fill, Stroke::new(1.5, Color32::BLACK));
