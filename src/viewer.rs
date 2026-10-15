@@ -913,7 +913,7 @@ impl Scale {
             let title = RichText::new(text).strong();
             match focus {
                 Some((http, c)) if me.on_right(http) == right => {
-                    hint.label(title.color(c).size(15.0)).tick_label_color(c)
+                    hint.label(title.color(c)).tick_label_color(c)
                 }
                 Some(_) => hint.label(title.color(weak)).tick_label_color(weak),
                 None => hint.label(title),
