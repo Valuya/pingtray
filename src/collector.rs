@@ -227,7 +227,7 @@ fn restart() {
         .spawn();
     match started {
         // the new one waits for our lock, released on exit
-        Ok(_) => std::process::exit(0),
+        Ok(_) => crate::tray::exit(),
         Err(e) => tracing::error!("restart failed: {e}"),
     }
 }

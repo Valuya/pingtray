@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// What the tray shows; rebuilt by the collector.
 #[derive(Clone, Default)]
@@ -80,6 +82,44 @@ pub fn own_exe() -> std::io::Result<PathBuf> {
         Some(s) => PathBuf::from(s),
         None => p,
     })
+}
+
+/// Closes the D-Bus connection of each open tray item.
+type Closer = Box<dyn Fn() -> ksni::ShutdownAwaiter + Send>;
+
+/// The tray items open in this process, closed by [`exit`].
+static OPEN: Mutex<Vec<Closer>> = Mutex::new(Vec::new());
+
+fn remember<T: ksni::Tray>(handle: &ksni::Handle<T>) {
+    let handle = handle.clone();
+    OPEN.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(move || handle.shutdown()));
+}
+
+/// Leaves after closing the tray items' D-Bus connections. A bare
+/// `process::exit` looks like a crash to the panel: GNOME's AppIndicator
+/// extension then rebuilds its icons from scratch, which has wedged
+/// gnome-shell. Must not run on a tray's own task (a menu callback): that
+/// task has to answer the shutdown request.
+pub fn exit() -> ! {
+    let closers = std::mem::take(&mut *OPEN.lock().unwrap_or_else(|e| e.into_inner()));
+    if !closers.is_empty() {
+        let closed = tokio::runtime::Builder::new_current_thread().enable_time().build().map(|rt| {
+            // the timer must be made inside the runtime
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    for close in &closers {
+                        close().await;
+                    }
+                })
+                .await
+            })
+        });
+        match closed {
+            Ok(Ok(())) => tracing::info!("tray items closed"),
+            _ => tracing::warn!("tray items not closed in time, leaving anyway"),
+        }
+    }
+    std::process::exit(0)
 }
 
 fn spawn_self(config_path: &std::path::Path, command: &[&str]) {
@@ -189,7 +229,8 @@ mod sni {
                 ksni::MenuItem::Separator,
                 StandardItem {
                     label: "Quit".into(),
-                    activate: Box::new(|_| std::process::exit(0)),
+                    // off the tray's task, which must answer the shutdown
+                    activate: Box::new(|_| drop(std::thread::spawn(|| exit()))),
                     ..Default::default()
                 }
                 .into(),
@@ -201,7 +242,10 @@ mod sni {
     pub async fn spawn(state: TrayState) -> Option<ksni::Handle<SniTray>> {
         // at login pingtray may start before the panel: wait for it
         match SniTray(state).assume_sni_available(true).spawn().await {
-            Ok(h) => Some(h),
+            Ok(h) => {
+                remember(&h);
+                Some(h)
+            }
             Err(e) => {
                 tracing::warn!("no system tray available ({e}); collecting without an icon");
                 None
@@ -329,6 +373,7 @@ mod power_sni {
             .assume_sni_available(true)
             .spawn()
             .await
+            .inspect(remember)
             .map_err(|e| tracing::warn!("charging icon: {e}"))
             .ok()
     }
