@@ -303,7 +303,9 @@ fn start_location_inputs(cfg: &Config) {
     }
     if loc.geoclue {
         crate::geoclue::ensure_desktop_file();
-        crate::geoclue::spawn(config::db_path());
+        // every ping within max_gap of a position, but never more than a scan a minute
+        let every = Duration::from_secs_f64((loc.max_gap_secs / 2.0).clamp(60.0, 300.0));
+        crate::geoclue::spawn(config::db_path(), every);
     }
     if let Some(listen) = &loc.listen {
         let started = listen

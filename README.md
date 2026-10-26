@@ -102,7 +102,9 @@ debugging aid: `adb = true` under `[location]`.
 
 The computer's own location service (GeoClue: Wi-Fi positioning, or a GPS
 stream shared on the local network) is used too; IP-based guesses (often
-tens of km off) are ignored.
+tens of km off) are ignored. It is asked for one position every few minutes,
+and not at all while the phone sends positions: each Wi-Fi scan takes the
+radio off its channel for a few seconds, which shows up as lost pings.
 
 Other ways:
 

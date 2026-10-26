@@ -271,6 +271,18 @@ impl Store {
         Ok(drop_vague(out))
     }
 
+    /// Time of the latest position from any source but `source`.
+    pub fn last_fix_ms_except(&self, source: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ts_ms FROM location WHERE source != ?1 ORDER BY ts_ms DESC LIMIT 1",
+                params![source],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn first_fix_ms(&self) -> Result<Option<i64>> {
         Ok(self.conn.query_row("SELECT MIN(ts_ms) FROM location", [], |r| r.get(0))?)
     }
