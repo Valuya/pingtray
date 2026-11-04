@@ -217,6 +217,21 @@ fn watch_config(path: PathBuf) {
     });
 }
 
+/// Logout (SIGTERM, SIGHUP) and Ctrl-C leave like Quit: tray items closed
+/// first.
+fn exit_on_signals() {
+    use tokio::signal::unix::{SignalKind, signal};
+    for kind in [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()] {
+        let Ok(mut stream) = signal(kind) else { continue };
+        tokio::spawn(async move {
+            stream.recv().await;
+            tracing::info!("signal {}, leaving", kind.as_raw_value());
+            // exit() runs its own runtime: not from inside this one
+            drop(std::thread::spawn(|| crate::tray::exit()));
+        });
+    }
+}
+
 fn restart() {
     let Ok(exe) = crate::tray::own_exe() else { return };
     // a new process, not exec(): the tray is registered on D-Bus under a name
@@ -341,6 +356,7 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
 
     start_location_inputs(&cfg);
     watch_config(config_path.clone());
+    exit_on_signals();
 
     let (tx, mut rx) = mpsc::channel::<Sample>(256);
     pinger::spawn_http(cfg.clone(), tx.clone());
