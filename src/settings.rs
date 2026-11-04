@@ -18,6 +18,7 @@ enum Tab {
     Tray,
     Positions,
     Power,
+    System,
 }
 
 pub struct SettingsApp {
@@ -351,6 +352,31 @@ impl SettingsApp {
 }
 
 impl SettingsApp {
+    fn system(&mut self, ui: &mut egui::Ui) {
+        use crate::system::Metric;
+        ui.label(RichText::new("System icons").strong());
+        ui.weak("One tray icon per metric: a number and the last minutes as a graph, in the metric's own colour.");
+        ui.add_space(8.0);
+        let chosen = &mut self.cfg.system.metrics;
+        for m in Metric::ALL {
+            let mut on = chosen.contains(&m);
+            let [r, g, b] = m.rgb();
+            if ui.checkbox(&mut on, RichText::new(m.title()).strong().color(egui::Color32::from_rgb(r, g, b))).changed() {
+                if on {
+                    chosen.push(m);
+                } else {
+                    chosen.retain(|x| *x != m);
+                }
+                // icons in a stable order
+                chosen.sort_by_key(|x| Metric::ALL.iter().position(|a| a == x));
+            }
+            ui.indent(m.key(), |ui| ui.weak(m.description()));
+            ui.add_space(4.0);
+        }
+        ui.add_space(8.0);
+        ui.weak("Left click on an icon opens GNOME System Monitor. Graph length and icon size follow the Tray icon tab.");
+    }
+
     fn power(&mut self, ui: &mut egui::Ui) {
         let p = &mut self.cfg.power;
         ui.checkbox(&mut p.enabled, RichText::new("Manage battery charging").strong());
@@ -525,6 +551,7 @@ impl eframe::App for SettingsApp {
                     (Tab::Tray, "Tray icon"),
                     (Tab::Positions, "Phone positions"),
                     (Tab::Power, "Power"),
+                    (Tab::System, "System"),
                 ] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
@@ -538,6 +565,7 @@ impl eframe::App for SettingsApp {
                 Tab::Tray => self.tray(ui),
                 Tab::Positions => self.positions(ui),
                 Tab::Power => self.power(ui),
+                Tab::System => self.system(ui),
             });
         });
     }
@@ -549,6 +577,7 @@ pub fn run(cfg: Config, path: PathBuf, tab: Option<&str>) -> anyhow::Result<()> 
         Some("tray") => Tab::Tray,
         Some("positions") => Tab::Positions,
         Some("power") => Tab::Power,
+        Some("system") => Tab::System,
         _ => Tab::Destinations,
     };
     let options = eframe::NativeOptions {

@@ -66,6 +66,23 @@ crowded train, quiet carriage, Wi-Fi on board. Notes show as markers on
 the charts, and the tooltip gives the latest one before the moment under
 the mouse.
 
+## System icons
+
+Like indicator-multiload, one tray icon per metric, chosen in Settings →
+System: CPU and memory by default, also swap, network, disk and pressure.
+Each shows a number and the last minutes as a graph in its own colour (never
+the green → red of connection quality). A white mark on top means something
+actually waited (Linux pressure stall information).
+
+Memory shows headroom: `MemAvailable`, which counts page cache as free since
+the kernel gives it back on demand. "Used = total - free" calls a machine
+with plenty to spare full. Swap reports zram (compressed in RAM) apart from
+disk swap.
+
+Read every second from `/proc`; the icons change at most every 5 s and only
+when the image or the menu text did, each through two alternating files.
+Left click opens GNOME System Monitor.
+
 ## Battery charging (Linux)
 
 Settings → Power. The battery icon's menu picks the mode:

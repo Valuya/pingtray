@@ -403,3 +403,101 @@ impl PowerTrayHandle {
         let _ = state;
     }
 }
+
+/// What one system-metric icon shows.
+#[derive(Clone)]
+pub struct SystemTrayState {
+    pub metric: crate::system::Metric,
+    pub icon_file: Option<PathBuf>,
+    pub status: Vec<String>,
+    pub config_path: PathBuf,
+}
+
+/// GNOME's process viewer, when installed.
+fn open_system_monitor() {
+    if let Err(e) = std::process::Command::new("gnome-system-monitor").spawn().map(|mut c| drop(std::thread::spawn(move || c.wait()))) {
+        tracing::warn!("cannot start gnome-system-monitor: {e}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod system_sni {
+    use super::*;
+    use ksni::TrayMethods;
+
+    pub struct SystemTray(pub SystemTrayState);
+
+    impl ksni::Tray for SystemTray {
+        fn id(&self) -> String {
+            format!("pingtray-{}", self.0.metric.key())
+        }
+        fn title(&self) -> String {
+            format!("pingtray {}", self.0.metric.title())
+        }
+        fn icon_name(&self) -> String {
+            self.0.icon_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        }
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip { title: self.0.metric.title().into(), description: self.0.status.join("\n"), ..Default::default() }
+        }
+        fn activate(&mut self, _x: i32, _y: i32) {
+            open_system_monitor();
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::StandardItem;
+            let mut items: Vec<ksni::MenuItem<Self>> = self
+                .0
+                .status
+                .iter()
+                .map(|line| StandardItem { label: line.replace('_', "__"), enabled: false, ..Default::default() }.into())
+                .collect();
+            items.extend([
+                ksni::MenuItem::Separator,
+                StandardItem { label: "System Monitor".into(), activate: Box::new(|_: &mut Self| open_system_monitor()), ..Default::default() }
+                    .into(),
+                StandardItem {
+                    label: "Settings…".into(),
+                    activate: Box::new(|t: &mut Self| open_settings_tab(&t.0.config_path, "system")),
+                    ..Default::default()
+                }
+                .into(),
+            ]);
+            items
+        }
+    }
+
+    pub async fn spawn(state: SystemTrayState) -> Option<ksni::Handle<SystemTray>> {
+        let metric = state.metric.title();
+        SystemTray(state)
+            .assume_sni_available(true)
+            .spawn()
+            .await
+            .inspect(remember)
+            .map_err(|e| tracing::warn!("{metric} icon: {e}"))
+            .ok()
+    }
+}
+
+pub struct SystemTrayHandle {
+    #[cfg(target_os = "linux")]
+    inner: ksni::Handle<system_sni::SystemTray>,
+}
+
+impl SystemTrayHandle {
+    #[cfg(target_os = "linux")]
+    pub async fn spawn(state: SystemTrayState) -> Option<SystemTrayHandle> {
+        system_sni::spawn(state).await.map(|inner| SystemTrayHandle { inner })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn spawn(_state: SystemTrayState) -> Option<SystemTrayHandle> {
+        None
+    }
+
+    pub async fn update(&self, state: SystemTrayState) {
+        #[cfg(target_os = "linux")]
+        self.inner.update(move |t| t.0 = state).await;
+        #[cfg(not(target_os = "linux"))]
+        let _ = state;
+    }
+}

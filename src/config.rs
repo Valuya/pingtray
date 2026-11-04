@@ -61,6 +61,8 @@ pub struct Config {
     pub targets: Vec<Target>,
     pub location: LocationConfig,
     pub power: crate::power::PowerConfig,
+    /// This computer's load: one tray icon per metric.
+    pub system: crate::system::SystemConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,6 +93,7 @@ impl Default for Config {
             targets: Vec::new(),
             location: LocationConfig::default(),
             power: crate::power::PowerConfig::default(),
+            system: crate::system::SystemConfig::default(),
         }
     }
 }

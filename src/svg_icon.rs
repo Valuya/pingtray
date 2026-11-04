@@ -255,6 +255,101 @@ pub fn battery(percentage: f64, preserve: bool, threshold: u32, charging: bool, 
     s
 }
 
+/// A system metric: its number, then the recent history as smoke in the
+/// metric's own hue. Marks on top where something waited (pressure).
+pub fn metric(label: &str, columns: &[(Column, bool)], ceiling: f64, rgb: [u8; 3], height: f64) -> String {
+    let h = height;
+    let text_w = h * 1.5;
+    let gap = h * 0.2;
+    let graph_w = (h * 2.6).max(columns.len() as f64 * 1.5);
+    let w = text_w + gap + graph_w;
+    let color = hex(rgb);
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.2} {h:.2}">"#
+    );
+    s.push_str(r#"<defs><filter id="soft" x="-5%" y="-20%" width="110%" height="140%"><feGaussianBlur stdDeviation="0.45"/></filter></defs>"#);
+    let size = if label.chars().count() > 3 { h * 0.55 } else { h * 0.68 };
+    let _ = write!(
+        s,
+        r#"<text x="{:.2}" y="{:.2}" text-anchor="end" font-family="{FONT}" font-weight="700" font-size="{size:.2}" fill="{WHITE}">{label}</text>"#,
+        text_w,
+        h * 0.5 + size * 0.36
+    );
+    let x0 = text_w + gap;
+    let (top, bottom) = (0.5, h - 0.5);
+    let y = |v: f64| bottom - (v / ceiling.max(f64::MIN_POSITIVE)).clamp(0.0, 1.0) * (bottom - top);
+    let _ = write!(
+        s,
+        r#"<rect x="{x0:.2}" y="0" width="{graph_w:.2}" height="{h:.2}" rx="{:.2}" fill="{WHITE}" fill-opacity="0.09"/>"#,
+        h * 0.12
+    );
+    let n = columns.len().max(1);
+    let cw = graph_w / n as f64;
+    let cx = |i: usize| x0 + (i as f64 + 0.5) * cw;
+    let mut runs: Vec<Vec<(usize, [f64; 5])>> = Vec::new();
+    for (i, (c, _)) in columns.iter().enumerate() {
+        if let Some(p) = c.pcts {
+            match runs.last_mut() {
+                Some(r) if r.last().is_some_and(|l| l.0 + 1 == i) => r.push((i, p)),
+                _ => runs.push(vec![(i, p)]),
+            }
+        }
+    }
+    for run in &runs {
+        let xs: Vec<f64> = if run.len() == 1 {
+            vec![cx(run[0].0) - cw / 2.0, cx(run[0].0) + cw / 2.0]
+        } else {
+            run.iter().map(|c| cx(c.0)).collect()
+        };
+        let vals = |k: usize| -> Vec<f64> {
+            if run.len() == 1 { vec![run[0].1[k]; 2] } else { run.iter().map(|c| c.1[k]).collect() }
+        };
+        // filled from the bottom up to the median, smoke from min to max
+        let med = vals(2);
+        let mut d = format!("M{:.2},{bottom:.2} ", xs[0]);
+        for (i, x) in xs.iter().enumerate() {
+            let _ = write!(d, "L{:.2},{:.2} ", x, y(med[i]));
+        }
+        let _ = write!(d, "L{:.2},{bottom:.2} Z", xs[xs.len() - 1]);
+        let _ = write!(s, r#"<path d="{d}" fill="{color}" fill-opacity="0.35"/>"#);
+        for (lo, hi, opacity) in [(0, 4, 0.25), (1, 3, 0.4)] {
+            let (los, his) = (vals(lo), vals(hi));
+            let mut d = String::new();
+            for (i, x) in xs.iter().enumerate() {
+                let _ = write!(d, "{}{:.2},{:.2} ", if i == 0 { "M" } else { "L" }, x, y(his[i]));
+            }
+            for (i, x) in xs.iter().enumerate().rev() {
+                let _ = write!(d, "L{:.2},{:.2} ", x, y(los[i]));
+            }
+            let _ = write!(s, r#"<path d="{d}Z" fill="{color}" fill-opacity="{opacity}" filter="url(#soft)"/>"#);
+        }
+        let mut d = String::new();
+        for (i, x) in xs.iter().enumerate() {
+            let _ = write!(d, "{}{:.2},{:.2} ", if i == 0 { "M" } else { "L" }, x, y(med[i]));
+        }
+        let _ = write!(
+            s,
+            r#"<path d="{d}" fill="none" stroke="{color}" stroke-width="{:.2}" stroke-linecap="round" stroke-linejoin="round"/>"#,
+            (h * 0.09).max(1.2)
+        );
+    }
+    for (i, (_, stalled)) in columns.iter().enumerate() {
+        if *stalled {
+            let _ = write!(
+                s,
+                r#"<rect x="{:.2}" y="0" width="{:.2}" height="{:.2}" fill="{WHITE}"/>"#,
+                x0 + i as f64 * cw + cw * 0.1,
+                cw * 0.8,
+                (h * 0.12).max(1.5)
+            );
+        }
+    }
+    s.push_str("</svg>");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +362,8 @@ mod tests {
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>") && svg.contains(">28<"));
         let b = battery(62.0, true, 80, true, true, 20.0);
         assert!(b.contains("<path") && b.contains("<polygon"));
+        let cols = vec![(Column::from_samples(&[Some(20.0), Some(40.0)]), false); 20];
+        let m = metric("23%", &cols, 100.0, [0xc0, 0x61, 0xcb], 20.0);
+        assert!(m.starts_with("<svg") && m.contains(">23%<") && m.contains("#c061cb"));
     }
 }

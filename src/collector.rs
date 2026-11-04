@@ -303,6 +303,53 @@ async fn start_power(cfg: &Config, config_path: &std::path::Path, with_tray: boo
     });
 }
 
+/// This computer's load: one tray icon per chosen metric, read every
+/// second, shown at most every 5 s and only when the image or menu changed.
+async fn start_system(cfg: &Config, config_path: &std::path::Path) {
+    use crate::system::{History, Metric};
+    use crate::tray::{SystemTrayHandle, SystemTrayState};
+    let mut icons = Vec::new();
+    for &metric in &cfg.system.metrics {
+        let state = SystemTrayState { metric, icon_file: None, status: Vec::new(), config_path: config_path.to_path_buf() };
+        let Some(handle) = SystemTrayHandle::spawn(state.clone()).await else { continue };
+        let Ok(sink) = IconSink::new(&config::runtime_dir().join("system-icons").join(metric.key())) else { continue };
+        icons.push((handle, sink, state, None::<(Option<PathBuf>, Vec<String>)>));
+    }
+    if icons.is_empty() {
+        return;
+    }
+    let columns = cfg.icon_columns.max(2);
+    let column_ms = (cfg.icon_column_secs * 1000.0) as i64;
+    let height = cfg.icon_height as f64;
+    tokio::spawn(async move {
+        let mut history = History::new(columns as i64 * column_ms + column_ms);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut last_shown: Option<Instant> = None;
+        loop {
+            tick.tick().await;
+            let now = crate::pinger::now_ms();
+            let Some(reading) = history.sample(now) else { continue };
+            if last_shown.is_some_and(|t| t.elapsed() < TRAY_REFRESH) {
+                continue;
+            }
+            last_shown = Some(Instant::now());
+            for (handle, sink, base, shown) in &mut icons {
+                let metric: Metric = base.metric;
+                let cols = history.columns(metric, now, columns, column_ms);
+                let svg = crate::svg_icon::metric(&reading.label(metric), &cols, history.ceiling(metric, &cols), metric.rgb(), height);
+                let icon_file = sink.write_svg(&svg).ok();
+                let status = reading.status(metric);
+                let now_shown = (icon_file.clone(), status.clone());
+                if shown.as_ref() == Some(&now_shown) {
+                    continue;
+                }
+                *shown = Some(now_shown);
+                handle.update(SystemTrayState { icon_file, status, ..base.clone() }).await;
+            }
+        }
+    });
+}
+
 /// Phone positions: HTTP endpoint and watched folder, when configured.
 fn start_location_inputs(cfg: &Config) {
     let loc = &cfg.location;
@@ -390,6 +437,9 @@ pub async fn run(cfg: Config, config_path: PathBuf, with_tray: bool) -> Result<(
         }
     }
 
+    if with_tray {
+        start_system(&cfg, &config_path).await;
+    }
     if cfg.power.enabled {
         start_power(&cfg, &config_path, with_tray).await;
     }
