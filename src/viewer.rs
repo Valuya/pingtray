@@ -1218,7 +1218,7 @@ fn local_offset(t: f64) -> f64 {
 }
 
 /// Time-axis marks on round local times (minutes, hours, midnights).
-fn time_grid(input: GridInput) -> Vec<GridMark> {
+pub(crate) fn time_grid(input: GridInput) -> Vec<GridMark> {
     let (min, max) = input.bounds;
     let span = (max - min).max(1.0);
     let major = STEPS.iter().copied().find(|s| span / s <= 8.0).unwrap_or(*STEPS.last().unwrap());
@@ -1237,7 +1237,7 @@ fn time_grid(input: GridInput) -> Vec<GridMark> {
     marks
 }
 
-fn fmt_axis(mark: GridMark) -> String {
+pub(crate) fn fmt_axis(mark: GridMark) -> String {
     let Some(dt) = Local.timestamp_opt(mark.value.round() as i64, 0).single() else {
         return String::new();
     };

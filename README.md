@@ -81,7 +81,13 @@ disk swap.
 
 Read every second from `/proc`; the icons change at most every 5 s and only
 when the image or the menu text did, each through two alternating files.
-Left click opens the system monitor (Resources, GNOME System Monitor or Mission Center, whichever is installed).
+
+Left click on an icon opens the system window: the same metrics over 10
+minutes to 7 days, with more curves (CPU by user, system, iowait and
+pressure, or one line per core; memory taken, available, cache and swap).
+The collector keeps a sample every 5 s for a week. The menu also opens the
+system monitor (Resources, GNOME System Monitor or Mission Center, whichever
+is installed). `pingtray system --metric memory` opens the window directly.
 
 ## Battery charging (Linux)
 

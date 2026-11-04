@@ -383,6 +383,159 @@ pub fn bytes_short(b: f64) -> String {
     if v < 9.95 { format!("{v:.1}{unit}") } else { format!("{v:.0}{unit}") }
 }
 
+// ---- detail for the system window ----
+
+/// Jiffies by kind, all cores together or one core.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CpuSplit {
+    user: u64,
+    system: u64,
+    iowait: u64,
+    steal: u64,
+    idle: u64,
+}
+
+impl CpuSplit {
+    fn parse(line: &str) -> Option<CpuSplit> {
+        let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+        if v.len() < 8 {
+            return None;
+        }
+        Some(CpuSplit { user: v[0] + v[1], system: v[2] + v[5] + v[6], iowait: v[4], steal: v[7], idle: v[3] })
+    }
+
+    fn total(&self) -> u64 {
+        self.user + self.system + self.iowait + self.steal + self.idle
+    }
+
+    fn minus(&self, b: &CpuSplit) -> CpuSplit {
+        CpuSplit {
+            user: self.user.saturating_sub(b.user),
+            system: self.system.saturating_sub(b.system),
+            iowait: self.iowait.saturating_sub(b.iowait),
+            steal: self.steal.saturating_sub(b.steal),
+            idle: self.idle.saturating_sub(b.idle),
+        }
+    }
+}
+
+/// (all cores, each core) from /proc/stat.
+fn cpu_splits(stat: &str) -> (CpuSplit, Vec<CpuSplit>) {
+    let mut all = CpuSplit::default();
+    let mut cores = Vec::new();
+    for l in stat.lines() {
+        if l.starts_with("cpu ") {
+            all = CpuSplit::parse(l).unwrap_or_default();
+        } else if l.starts_with("cpu") {
+            cores.extend(CpuSplit::parse(l));
+        }
+    }
+    (all, cores)
+}
+
+/// Everything the system window draws, for a few seconds: shares in
+/// percent, sizes in bytes, rates in bytes per second.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Detail {
+    pub ts_ms: i64,
+    pub cpu_user: f64,
+    pub cpu_system: f64,
+    pub cpu_iowait: f64,
+    pub cpu_steal: f64,
+    /// Busy share of each core (iowait counts as idle).
+    pub cores: Vec<f64>,
+    pub mem_total: f64,
+    pub mem_available: f64,
+    pub mem_cache: f64,
+    pub swap_total: f64,
+    pub swap_zram: f64,
+    pub swap_disk: f64,
+    pub zram_ram: f64,
+    pub net_in: f64,
+    pub net_out: f64,
+    pub disk_read: f64,
+    pub disk_write: f64,
+    pub psi_cpu: f64,
+    pub psi_mem: f64,
+    pub psi_io: f64,
+}
+
+impl Detail {
+    pub fn cpu_busy(&self) -> f64 {
+        self.cpu_user + self.cpu_system + self.cpu_steal
+    }
+
+    pub fn mem_used(&self) -> f64 {
+        self.mem_total - self.mem_available
+    }
+
+    /// Cores packed one byte each (0..=200, half percents) for the database.
+    pub fn cores_blob(&self) -> Vec<u8> {
+        self.cores.iter().map(|c| (c * 2.0).round().clamp(0.0, 200.0) as u8).collect()
+    }
+
+    pub fn cores_from_blob(blob: &[u8]) -> Vec<f64> {
+        blob.iter().map(|&b| b as f64 / 2.0).collect()
+    }
+}
+
+/// How long the system window can look back.
+pub const KEEP_MS: i64 = 7 * 86_400_000;
+
+/// Reads /proc every call and gives what changed since the previous call.
+pub struct Recorder {
+    previous: Option<(std::time::Instant, Raw, CpuSplit, Vec<CpuSplit>)>,
+}
+
+impl Recorder {
+    pub fn new() -> Recorder {
+        Recorder { previous: None }
+    }
+
+    /// The first call only sets the starting point.
+    pub fn sample(&mut self, now_ms: i64) -> Option<Detail> {
+        let raw = read_all();
+        let (all, cores) = cpu_splits(&read("/proc/stat"));
+        let at = std::time::Instant::now();
+        let (t0, prev, prev_all, prev_cores) = self.previous.replace((at, raw, all, cores.clone()))?;
+        let secs = at.duration_since(t0).as_secs_f64();
+        let d = all.minus(&prev_all);
+        let share = |x: u64| if d.total() == 0 { 0.0 } else { x as f64 * 100.0 / d.total() as f64 };
+        let cores = cores
+            .iter()
+            .zip(&prev_cores)
+            .map(|(c, p)| {
+                let d = c.minus(p);
+                let t = d.total();
+                if t == 0 { 0.0 } else { (d.user + d.system + d.steal) as f64 * 100.0 / t as f64 }
+            })
+            .collect();
+        let kb = |k: u64| k as f64 * 1024.0;
+        Some(Detail {
+            ts_ms: now_ms,
+            cpu_user: share(d.user),
+            cpu_system: share(d.system),
+            cpu_iowait: share(d.iowait),
+            cpu_steal: share(d.steal),
+            cores,
+            mem_total: kb(raw.mem.total_kb),
+            mem_available: kb(raw.mem.available_kb),
+            mem_cache: kb(raw.mem.cache_kb),
+            swap_total: kb(raw.mem.swap_total_kb),
+            swap_zram: kb(raw.swap.0),
+            swap_disk: kb(raw.swap.1),
+            zram_ram: if raw.swap.0 > 0 { zram_ram_bytes() as f64 } else { 0.0 },
+            net_in: rate(raw.net.0, prev.net.0, secs),
+            net_out: rate(raw.net.1, prev.net.1, secs),
+            disk_read: rate(raw.disk.0, prev.disk.0, secs),
+            disk_write: rate(raw.disk.1, prev.disk.1, secs),
+            psi_cpu: raw.psi_cpu,
+            psi_mem: raw.psi_mem,
+            psi_io: raw.psi_io,
+        })
+    }
+}
+
 // ---- history for the icon ----
 
 /// The last few minutes, one reading a second.
@@ -486,6 +639,19 @@ mod tests {
         assert_eq!(net_bytes(dev), (100, 40));
         let ds = "259 0 nvme0n1 1 0 10 0 1 0 20 0 0 0 0\n259 1 nvme0n1p1 1 0 10 0 1 0 20 0 0 0 0\n";
         assert_eq!(disk_bytes(ds, |n| n == "nvme0n1"), (10 * 512, 20 * 512));
+    }
+
+    #[test]
+    fn cpu_split_per_core() {
+        let a = "cpu  10 0 10 80 0 0 0 0\ncpu0 5 0 5 40 0 0 0 0\ncpu1 5 0 5 40 0 0 0 0\n";
+        let b = "cpu  30 0 10 100 20 0 0 0\ncpu0 25 0 5 40 0 0 0 0\ncpu1 5 0 5 60 20 0 0 0\n";
+        let (all_a, cores_a) = cpu_splits(a);
+        let (all_b, cores_b) = cpu_splits(b);
+        let d = all_b.minus(&all_a);
+        assert_eq!((d.user, d.iowait, d.idle, d.total()), (20, 20, 20, 60));
+        assert_eq!(cores_b[0].minus(&cores_a[0]).user, 20);
+        let detail = Detail { cores: vec![0.0, 37.3, 100.0], ..Default::default() };
+        assert_eq!(Detail::cores_from_blob(&detail.cores_blob()), vec![0.0, 37.5, 100.0]);
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod smoke;
 mod store;
 mod svg_icon;
 mod system;
+mod system_view;
 mod transport;
 mod tray;
 mod viewer;
@@ -50,6 +51,12 @@ enum Command {
     /// Add a note for now ("crowded train"); without text, open the note window.
     Note {
         text: Vec<String>,
+    },
+    /// Open the system window (CPU, memory... over time).
+    System {
+        /// Metric to show first: cpu, memory, swap, network, disk or pressure.
+        #[arg(long)]
+        metric: Option<String>,
     },
     /// Open the settings window.
     Settings {
@@ -187,6 +194,14 @@ fn main() -> Result<()> {
         }
         Command::Autostart { remove } => autostart(remove, &config_path),
         Command::Note { text } => notes::run(&text),
+        Command::System { metric } => {
+            let lock = if std::env::var_os("PINGTRAY_SNAPSHOT").is_some() { Some(None) } else { take_over("system.lock")?.map(Some) };
+            let Some(_lock) = lock else {
+                tracing::info!("system window already open");
+                return Ok(());
+            };
+            system_view::run(metric.as_deref())
+        }
         Command::Settings { tab } => {
             let Some(_lock) = take_over("settings.lock")? else {
                 tracing::info!("settings already open");

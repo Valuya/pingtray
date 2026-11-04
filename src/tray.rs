@@ -66,6 +66,10 @@ pub fn open_note(config_path: &std::path::Path) {
     spawn_self(config_path, &["note"]);
 }
 
+pub fn open_system_view(config_path: &std::path::Path, metric: &str) {
+    spawn_self(config_path, &["system", "--metric", metric]);
+}
+
 pub fn open_settings_tab(config_path: &std::path::Path, tab: &str) {
     spawn_self(config_path, &["settings", "--tab", tab]);
 }
@@ -450,7 +454,7 @@ mod system_sni {
             ksni::ToolTip { title: self.0.metric.title().into(), description: self.0.status.join("\n"), ..Default::default() }
         }
         fn activate(&mut self, _x: i32, _y: i32) {
-            open_system_monitor();
+            open_system_view(&self.0.config_path, self.0.metric.key());
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             use ksni::menu::StandardItem;
@@ -462,6 +466,12 @@ mod system_sni {
                 .collect();
             items.extend([
                 ksni::MenuItem::Separator,
+                StandardItem {
+                    label: "Graphs…".into(),
+                    activate: Box::new(|t: &mut Self| open_system_view(&t.0.config_path, t.0.metric.key())),
+                    ..Default::default()
+                }
+                .into(),
                 StandardItem { label: "System Monitor".into(), activate: Box::new(|_: &mut Self| open_system_monitor()), ..Default::default() }
                     .into(),
                 StandardItem {

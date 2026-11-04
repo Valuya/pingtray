@@ -374,7 +374,7 @@ impl SettingsApp {
             ui.add_space(4.0);
         }
         ui.add_space(8.0);
-        ui.weak("Left click on an icon opens the system monitor (Resources or GNOME System Monitor). Graph length and icon size follow the Tray icon tab.");
+        ui.weak("Left click on an icon opens its graphs over time; the menu also opens the system monitor. Graph length and icon size follow the Tray icon tab.");
     }
 
     fn power(&mut self, ui: &mut egui::Ui) {

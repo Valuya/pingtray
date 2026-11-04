@@ -73,7 +73,7 @@ impl Bucket {
 }
 
 /// Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
@@ -179,6 +179,34 @@ impl Store {
                      lat   REAL NOT NULL,
                      lon   REAL NOT NULL,
                      acc_m REAL
+                 );",
+            )?;
+        }
+        if version < 6 {
+            self.conn.execute_batch(
+                "-- this computer's load every few seconds, for the system window;
+                 -- shares in %, sizes in bytes, rates in bytes/s, cores 1 byte each (half %)
+                 CREATE TABLE IF NOT EXISTS system_sample (
+                     ts_ms         INTEGER PRIMARY KEY,
+                     cpu_user      REAL NOT NULL,
+                     cpu_system    REAL NOT NULL,
+                     cpu_iowait    REAL NOT NULL,
+                     cpu_steal     REAL NOT NULL,
+                     cores         BLOB NOT NULL,
+                     mem_total     REAL NOT NULL,
+                     mem_available REAL NOT NULL,
+                     mem_cache     REAL NOT NULL,
+                     swap_total    REAL NOT NULL,
+                     swap_zram     REAL NOT NULL,
+                     swap_disk     REAL NOT NULL,
+                     zram_ram      REAL NOT NULL,
+                     net_in        REAL NOT NULL,
+                     net_out       REAL NOT NULL,
+                     disk_read     REAL NOT NULL,
+                     disk_write    REAL NOT NULL,
+                     psi_cpu       REAL NOT NULL,
+                     psi_mem       REAL NOT NULL,
+                     psi_io        REAL NOT NULL
                  );",
             )?;
         }
@@ -294,6 +322,55 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    pub fn insert_system(&self, d: &crate::system::Detail) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO system_sample VALUES
+                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            )?
+            .execute(params![
+                d.ts_ms, d.cpu_user, d.cpu_system, d.cpu_iowait, d.cpu_steal, d.cores_blob(), d.mem_total,
+                d.mem_available, d.mem_cache, d.swap_total, d.swap_zram, d.swap_disk, d.zram_ram, d.net_in,
+                d.net_out, d.disk_read, d.disk_write, d.psi_cpu, d.psi_mem, d.psi_io
+            ])?;
+        Ok(())
+    }
+
+    /// System samples in `[from_ms, to_ms)`, by time.
+    pub fn system(&self, from_ms: i64, to_ms: i64) -> Result<Vec<crate::system::Detail>> {
+        let mut stmt = self.conn.prepare_cached("SELECT * FROM system_sample WHERE ts_ms >= ?1 AND ts_ms < ?2 ORDER BY ts_ms")?;
+        let rows = stmt.query_map(params![from_ms, to_ms], |r| {
+            let blob: Vec<u8> = r.get(5)?;
+            Ok(crate::system::Detail {
+                ts_ms: r.get(0)?,
+                cpu_user: r.get(1)?,
+                cpu_system: r.get(2)?,
+                cpu_iowait: r.get(3)?,
+                cpu_steal: r.get(4)?,
+                cores: crate::system::Detail::cores_from_blob(&blob),
+                mem_total: r.get(6)?,
+                mem_available: r.get(7)?,
+                mem_cache: r.get(8)?,
+                swap_total: r.get(9)?,
+                swap_zram: r.get(10)?,
+                swap_disk: r.get(11)?,
+                zram_ram: r.get(12)?,
+                net_in: r.get(13)?,
+                net_out: r.get(14)?,
+                disk_read: r.get(15)?,
+                disk_write: r.get(16)?,
+                psi_cpu: r.get(17)?,
+                psi_mem: r.get(18)?,
+                psi_io: r.get(19)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn prune_system(&self, before_ms: i64) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM system_sample WHERE ts_ms < ?1", [before_ms])?)
     }
 
     pub fn set_rough_position(&self, f: &Fix) -> Result<()> {
@@ -504,6 +581,24 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_and_rough_round_trip() {
+        let dir = std::env::temp_dir().join(format!("pingtray-test-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let d = crate::system::Detail { ts_ms: 5000, cpu_user: 12.5, cores: vec![10.0, 99.5], mem_total: 8e9, psi_io: 0.3, ..Default::default() };
+        store.insert_system(&d).unwrap();
+        store.insert_system(&crate::system::Detail { ts_ms: 1000, ..Default::default() }).unwrap();
+        assert_eq!(store.system(2000, 9000).unwrap(), vec![d]);
+        assert_eq!(store.prune_system(2000).unwrap(), 1);
+        let rough = Fix { ts_ms: 9000, lat: 50.8, lon: 4.3, acc_m: Some(25_000.0), alt_m: None, speed_ms: None };
+        assert_eq!(store.approximate_position().unwrap(), None);
+        store.set_rough_position(&rough).unwrap();
+        assert_eq!(store.approximate_position().unwrap(), Some(rough));
+    }
 
     #[test]
     fn buckets_aggregate_rtt_and_loss() {

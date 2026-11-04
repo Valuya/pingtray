@@ -321,10 +321,13 @@ async fn start_system(cfg: &Config, config_path: &std::path::Path) {
     let columns = cfg.icon_columns.max(2);
     let column_ms = (cfg.icon_column_secs * 1000.0) as i64;
     let height = cfg.icon_height as f64;
+    let store = Store::open(&config::db_path()).map_err(|e| tracing::warn!("system samples not kept: {e:#}")).ok();
     tokio::spawn(async move {
         let mut history = History::new(columns as i64 * column_ms + column_ms);
+        let mut recorder = crate::system::Recorder::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last_shown: Option<Instant> = None;
+        let mut last_pruned: Option<Instant> = None;
         loop {
             tick.tick().await;
             let now = crate::pinger::now_ms();
@@ -333,6 +336,16 @@ async fn start_system(cfg: &Config, config_path: &std::path::Path) {
                 continue;
             }
             last_shown = Some(Instant::now());
+            // the system window's data: what changed over these few seconds
+            if let (Some(store), Some(detail)) = (&store, recorder.sample(now)) {
+                if let Err(e) = store.insert_system(&detail) {
+                    tracing::warn!("system sample: {e:#}");
+                }
+                if last_pruned.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+                    last_pruned = Some(Instant::now());
+                    let _ = store.prune_system(now - crate::system::KEEP_MS);
+                }
+            }
             for (handle, sink, base, shown) in &mut icons {
                 let metric: Metric = base.metric;
                 let cols = history.columns(metric, now, columns, column_ms);
