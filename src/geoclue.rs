@@ -98,7 +98,8 @@ fn run(db: &std::path::Path, every: Duration) -> Result<()> {
             tracing::debug!("GeoClue: recent positions from elsewhere, no scan");
         } else if let Some(fix) = sample(&conn)? {
             if fix.acc_m.is_some_and(|a| a > USELESS_M) {
-                tracing::debug!("GeoClue: only a rough guess ({:?} m), not recorded", fix.acc_m);
+                tracing::debug!("GeoClue: only a rough guess ({:?} m), kept apart", fix.acc_m);
+                store.set_rough_position(&fix)?;
             } else {
                 store.insert_fixes(&[fix], SOURCE)?;
             }

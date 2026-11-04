@@ -73,7 +73,7 @@ impl Bucket {
 }
 
 /// Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
@@ -167,6 +167,19 @@ impl Store {
                      text  TEXT NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS note_ts ON note(ts_ms);",
+            )?;
+        }
+        if version < 5 {
+            self.conn.execute_batch(
+                "-- the latest guess too coarse to record (GeoClue's IP fallback: 25 km),
+                 -- so that an empty map can still show roughly where we are
+                 CREATE TABLE IF NOT EXISTS rough_position (
+                     id    INTEGER PRIMARY KEY CHECK (id = 1),
+                     ts_ms INTEGER NOT NULL,
+                     lat   REAL NOT NULL,
+                     lon   REAL NOT NULL,
+                     acc_m REAL
+                 );",
             )?;
         }
         if version < SCHEMA_VERSION {
@@ -281,6 +294,27 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    pub fn set_rough_position(&self, f: &Fix) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO rough_position(id, ts_ms, lat, lon, acc_m) VALUES (1, ?1, ?2, ?3, ?4)",
+            params![f.ts_ms, f.lat, f.lon, f.acc_m],
+        )?;
+        Ok(())
+    }
+
+    /// The latest coarse guess, or the latest recorded position if newer.
+    pub fn approximate_position(&self) -> Result<Option<Fix>> {
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok(Fix { ts_ms: r.get(0)?, lat: r.get(1)?, lon: r.get(2)?, acc_m: r.get(3)?, alt_m: None, speed_ms: None })
+        };
+        let rough = self.conn.query_row("SELECT ts_ms, lat, lon, acc_m FROM rough_position", [], row).optional()?;
+        let last = self
+            .conn
+            .query_row("SELECT ts_ms, lat, lon, acc_m FROM location ORDER BY ts_ms DESC LIMIT 1", [], row)
+            .optional()?;
+        Ok([rough, last].into_iter().flatten().max_by_key(|f| f.ts_ms))
     }
 
     pub fn first_fix_ms(&self) -> Result<Option<i64>> {

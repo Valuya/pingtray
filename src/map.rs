@@ -54,6 +54,8 @@ pub struct MapView {
     daily: Option<daily::Params>,
     daily_result: Option<daily::Result>,
     daily_pending: Option<(daily::Params, mpsc::Receiver<daily::Result>)>,
+    /// Roughly where we are, for an empty map; read again every minute.
+    approx: Option<(std::time::Instant, Option<Fix>)>,
 }
 
 /// Colour of the connection at a time (ms), when known.
@@ -149,6 +151,7 @@ impl MapView {
             daily: None,
             daily_result: None,
             daily_pending: None,
+            approx: None,
         }
     }
 
@@ -299,9 +302,8 @@ impl MapView {
         };
         self.legend(ui, &segments, &shown);
         if shown.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label(if fixes.is_empty() { "No position in this time range." } else { "No position for this transport." })
-            });
+            let why = if fixes.is_empty() { "No position recorded in this time range." } else { "No position for this transport." };
+            self.approximate(ui, why);
             return (None, false);
         }
         if self.need_fit
@@ -376,6 +378,55 @@ impl MapView {
                 }
             });
         (clicked, false)
+    }
+
+    /// An empty track: the map around the latest guess of where we are, with
+    /// its uncertainty, and the reason nothing is drawn.
+    fn approximate(&mut self, ui: &mut egui::Ui, why: &str) {
+        if self.approx.as_ref().is_none_or(|(at, _)| at.elapsed().as_secs() >= 60) {
+            let fix = self.store.as_ref().and_then(|s| s.approximate_position().ok().flatten());
+            if fix.is_some() && self.approx.as_ref().is_none_or(|(_, f)| f.is_none()) {
+                self.need_fit = true;
+            }
+            self.approx = Some((std::time::Instant::now(), fix));
+        }
+        let Some(fix) = self.approx.as_ref().and_then(|a| a.1) else {
+            ui.centered_and_justified(|ui| ui.label(why));
+            return;
+        };
+        let acc = fix.acc_m.unwrap_or(DEFAULT_ACC_M);
+        let age_s = (crate::pinger::now_ms() - fix.ts_ms).max(0) / 1000;
+        let when = match age_s {
+            ..120 => "now".to_string(),
+            ..7200 => format!("{} min ago", age_s / 60),
+            ..172_800 => format!("{} h ago", age_s / 3600),
+            _ => local(fix.ts_ms as f64 / 1000.0, "%d/%m %H:%M"),
+        };
+        let within = if acc >= 1000.0 { format!("{:.0} km", acc / 1000.0) } else { format!("{acc:.0} m") };
+        let note = format!("{why}\nApproximately here ({when}, within {within}).");
+        if self.need_fit {
+            // the uncertainty disc fills the map
+            let dlat = acc / 111_320.0;
+            let dlon = dlat / fix.lat.to_radians().cos().max(0.01);
+            self.memory.center_at(lat_lon(fix.lat, fix.lon));
+            let _ = self.memory.set_zoom(fit_zoom([fix.lat - dlat, fix.lon - dlon, fix.lat + dlat, fix.lon + dlon], ui.available_size()));
+            self.need_fit = false;
+        }
+        Map::new(Some(&mut self.tiles), &mut self.memory, lat_lon(fix.lat, fix.lon))
+            .zoom_with_ctrl(false)
+            .show(ui, |ui, response, projector, _| {
+                let painter = ui.painter_at(response.rect);
+                let at = lat_lon(fix.lat, fix.lon);
+                let p = projector.project(at).to_pos2();
+                let r = (acc as f32 * projector.scale_pixel_per_meter(at)).max(6.0);
+                painter.circle(p, r, Color32::from_rgba_unmultiplied(53, 132, 228, 40), Stroke::new(2.0, Color32::from_rgb(53, 132, 228)));
+                painter.circle(p, 5.0, Color32::from_rgb(53, 132, 228), Stroke::new(1.5, Color32::WHITE));
+                let galley = painter.layout(note, egui::FontId::proportional(14.0), Color32::WHITE, response.rect.width() - 40.0);
+                let top = response.rect.center_top() + egui::vec2(-galley.size().x / 2.0, 12.0);
+                let frame = egui::Rect::from_min_size(top, galley.size()).expand(8.0);
+                painter.rect_filled(frame, 6.0, Color32::from_black_alpha(190));
+                painter.galley(top, galley, Color32::WHITE);
+            });
     }
 
     fn load_history(&mut self, input: &MapInput<'_>) {
