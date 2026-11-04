@@ -414,10 +414,19 @@ pub struct SystemTrayState {
 }
 
 /// GNOME's process viewer, when installed.
+/// The first system monitor installed: Ubuntu 26.10 ships Resources, older
+/// GNOME has System Monitor, some people install Mission Center.
+const SYSTEM_MONITORS: [&str; 3] = ["resources", "gnome-system-monitor", "missioncenter"];
+
 fn open_system_monitor() {
-    if let Err(e) = std::process::Command::new("gnome-system-monitor").spawn().map(|mut c| drop(std::thread::spawn(move || c.wait()))) {
-        tracing::warn!("cannot start gnome-system-monitor: {e}");
+    for app in SYSTEM_MONITORS {
+        match std::process::Command::new(app).spawn() {
+            Ok(mut c) => return drop(std::thread::spawn(move || c.wait())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return tracing::warn!("cannot start {app}: {e}"),
+        }
     }
+    tracing::warn!("no system monitor found (tried {})", SYSTEM_MONITORS.join(", "));
 }
 
 #[cfg(target_os = "linux")]

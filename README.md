@@ -81,7 +81,7 @@ disk swap.
 
 Read every second from `/proc`; the icons change at most every 5 s and only
 when the image or the menu text did, each through two alternating files.
-Left click opens GNOME System Monitor.
+Left click opens the system monitor (Resources, GNOME System Monitor or Mission Center, whichever is installed).
 
 ## Battery charging (Linux)
 
